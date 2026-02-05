@@ -387,11 +387,15 @@ function App() {
     const a = document.createElement('a')
     a.href = url
     a.download = filename
+    a.rel = 'noopener'
     a.style.display = 'none'
     document.body.appendChild(a)
-    a.click()
-    document.body.removeChild(a)
-    setTimeout(() => URL.revokeObjectURL(url), 100)
+    // Defer click so it runs after current event; ensures download in all browsers when triggered from menu
+    setTimeout(() => {
+      a.click()
+      document.body.removeChild(a)
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    }, 0)
   }
 
   function exportQueryResultsAsJson(tabId: string) {
@@ -409,7 +413,7 @@ function App() {
     const json = JSON.stringify(rows, null, 2)
     const blob = new Blob([json], { type: 'application/json' })
     downloadBlob(blob, `${tab.tableName}-results.json`)
-    setOpenPaneMenuId(null)
+    setTimeout(() => setOpenPaneMenuId(null), 0)
   }
 
   function exportQueryResultsAsCsv(tabId: string) {
@@ -426,7 +430,7 @@ function App() {
     const csv = [header, ...lines].join('\n')
     const blob = new Blob([csv], { type: 'text/csv' })
     downloadBlob(blob, `${tab.tableName}-results.csv`)
-    setOpenPaneMenuId(null)
+    setTimeout(() => setOpenPaneMenuId(null), 0)
   }
 
   function handleCloseTab(tabId: string, e: React.MouseEvent) {
@@ -614,14 +618,7 @@ function App() {
       const filename = dbFilename ?? 'database.vyp'
       zip.file(filename, data)
       const blob = await zip.generateAsync({ type: 'blob' })
-      const link = document.createElement('a')
-      const href = URL.createObjectURL(blob)
-      link.href = href
-      link.download = vybFilename ?? 'database.vyb'
-      document.body.appendChild(link)
-      link.click()
-      document.body.removeChild(link)
-      URL.revokeObjectURL(href)
+      downloadBlob(blob, vybFilename ?? 'database.vyb')
     } catch (err) {
       console.error(err)
     }
