@@ -421,16 +421,48 @@ function App() {
     if (!tab) return
     const data = getTabResultData(tab)
     if (!data || data.values.length === 0) return
+    const csv = buildCsvFromResult(data)
+    const blob = new Blob([csv], { type: 'text/csv' })
+    downloadBlob(blob, `${tab.tableName}-results.csv`)
+    setTimeout(() => setOpenPaneMenuId(null), 0)
+  }
+
+  function buildCsvFromResult(data: QueryExecResult): string {
     const escape = (v: unknown) => {
       const s = String(v ?? '')
       return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s
     }
     const header = data.columns.map(escape).join(',')
     const lines = data.values.map((row) => row.map(escape).join(','))
-    const csv = [header, ...lines].join('\n')
-    const blob = new Blob([csv], { type: 'text/csv' })
-    downloadBlob(blob, `${tab.tableName}-results.csv`)
-    setTimeout(() => setOpenPaneMenuId(null), 0)
+    return [header, ...lines].join('\n')
+  }
+
+  async function copyQueryResultsAsCsv(tabId: string) {
+    const tab = tabs.find((t): t is TableTab => t.id === tabId && isTableTab(t))
+    if (!tab) return
+    const data = getTabResultData(tab)
+    if (!data || data.values.length === 0) return
+    const csv = buildCsvFromResult(data)
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(csv)
+      } else {
+        // Fallback for very old browsers: use a hidden textarea
+        const textarea = document.createElement('textarea')
+        textarea.value = csv
+        textarea.style.position = 'fixed'
+        textarea.style.left = '-9999px'
+        document.body.appendChild(textarea)
+        textarea.focus()
+        textarea.select()
+        document.execCommand('copy')
+        document.body.removeChild(textarea)
+      }
+    } catch (err) {
+      console.error('Failed to copy results', err)
+    } finally {
+      setTimeout(() => setOpenPaneMenuId(null), 0)
+    }
   }
 
   function handleCloseTab(tabId: string, e: React.MouseEvent) {
@@ -1039,6 +1071,13 @@ function App() {
                                   disabled={!getTabResultData(tab) || getTabResultData(tab)!.values.length === 0}
                                 >
                                   Export as CSV
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => copyQueryResultsAsCsv(tab.id)}
+                                  disabled={!getTabResultData(tab) || getTabResultData(tab)!.values.length === 0}
+                                >
+                                  Copy results to clipboard
                                 </button>
                               </div>
                             )}
