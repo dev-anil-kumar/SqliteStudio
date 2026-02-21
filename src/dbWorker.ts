@@ -15,12 +15,16 @@ type TableInfo = {
   createStatement: string | null
 }
 
+type AdvancedSearchMatch = { tableName: string; matchCount: number }
+
 type InMessage =
   | { type: 'open'; baseUrl: string; bytes: ArrayBuffer; id: number }
   | { type: 'exec'; id: number; query: string }
   | { type: 'getTableNames'; id: number }
   | { type: 'getTableInfo'; id: number; name: string }
   | { type: 'export'; id: number }
+  | { type: 'advancedSearchRaw'; id: number; value: string }
+  | { type: 'advancedSearchJson'; id: number; criteria: Record<string, unknown> }
 
 let SQL: Awaited<ReturnType<typeof initSqlJs>> | null = null
 let db: import('sql.js').Database | null = null
@@ -116,6 +120,92 @@ function getTableInfo(name: string): TableInfo {
   }
 }
 
+function escapeLikePattern(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_')
+}
+
+function quoteIdentifier(name: string): string {
+  return `"${name.replace(/"/g, '""')}"`
+}
+
+function sqlLiteral(v: unknown): string {
+  if (v === null || v === undefined) return 'NULL'
+  if (typeof v === 'number') return String(v)
+  if (typeof v === 'boolean') return v ? '1' : '0'
+  return "'" + String(v).replace(/'/g, "''") + "'"
+}
+
+function advancedSearchRaw(value: string): AdvancedSearchMatch[] {
+  if (!db) return []
+  const escaped = escapeLikePattern(value)
+  const pattern = `%${escaped}%`
+  const namesRes = db.exec("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;")
+  const tableNames: string[] = []
+  if (namesRes[0]) {
+    const idx = namesRes[0].columns.indexOf('name')
+    if (idx !== -1) {
+      namesRes[0].values.forEach((row: unknown[]) => tableNames.push(String(row[idx])))
+    }
+  }
+  const matches: AdvancedSearchMatch[] = []
+  for (const tableName of tableNames) {
+    try {
+      const info = getTableInfo(tableName)
+      if (info.columns.length === 0) continue
+      const quoted = quoteIdentifier(tableName)
+      const conditions = info.columns
+        .map((col) => `CAST(${quoteIdentifier(col)} AS TEXT) LIKE '${pattern.replace(/'/g, "''")}' ESCAPE '\\'`)
+        .join(' OR ')
+      const res = db.exec(`SELECT COUNT(*) AS c FROM ${quoted} WHERE (${conditions});`)
+      if (res[0] && res[0].values.length > 0) {
+        const count = Number(res[0].values[0][0]) || 0
+        if (count > 0) matches.push({ tableName, matchCount: count })
+      }
+    } catch {
+      /* skip table */
+    }
+  }
+  return matches
+}
+
+function advancedSearchJson(criteria: Record<string, unknown>): AdvancedSearchMatch[] {
+  if (!db) return []
+  const keys = Object.keys(criteria)
+  if (keys.length === 0) return []
+  const namesRes = db.exec("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;")
+  const tableNames: string[] = []
+  if (namesRes[0]) {
+    const idx = namesRes[0].columns.indexOf('name')
+    if (idx !== -1) {
+      namesRes[0].values.forEach((row: unknown[]) => tableNames.push(String(row[idx])))
+    }
+  }
+  const matches: AdvancedSearchMatch[] = []
+  for (const tableName of tableNames) {
+    try {
+      const info = getTableInfo(tableName)
+      const tableCols = new Set(info.columns.map((c) => c.toLowerCase()))
+      const hasAll = keys.every((k) => tableCols.has(k.toLowerCase()))
+      if (!hasAll) continue
+      const quoted = quoteIdentifier(tableName)
+      const conditions = keys
+        .map((k) => {
+          const col = info.columns.find((c) => c.toLowerCase() === k.toLowerCase())!
+          return `${quoteIdentifier(col)} = ${sqlLiteral(criteria[k])}`
+        })
+        .join(' AND ')
+      const res = db.exec(`SELECT COUNT(*) AS c FROM ${quoted} WHERE (${conditions});`)
+      if (res[0] && res[0].values.length > 0) {
+        const count = Number(res[0].values[0][0]) || 0
+        if (count > 0) matches.push({ tableName, matchCount: count })
+      }
+    } catch {
+      /* skip table */
+    }
+  }
+  return matches
+}
+
 self.onmessage = async (e: MessageEvent<InMessage>) => {
   const msg = e.data
   try {
@@ -173,6 +263,18 @@ self.onmessage = async (e: MessageEvent<InMessage>) => {
     if (msg.type === 'export') {
       const data = db.export()
       self.postMessage({ type: 'exported', id: msg.id, data }, { transfer: [data.buffer] })
+      return
+    }
+
+    if (msg.type === 'advancedSearchRaw') {
+      const matches = advancedSearchRaw(msg.value)
+      self.postMessage({ type: 'advancedSearchResult', id: msg.id, matches })
+      return
+    }
+
+    if (msg.type === 'advancedSearchJson') {
+      const matches = advancedSearchJson(msg.criteria)
+      self.postMessage({ type: 'advancedSearchResult', id: msg.id, matches })
       return
     }
   } catch (err) {

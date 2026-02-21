@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import JSZip from 'jszip'
 import { getRecentList, loadRecentDb, saveRecentDb, formatRecentDate } from './recentDb'
-import { openDb, execQuery, getTableNames, getTableInfo, exportDb, type TableInfo, type QueryExecResult } from './dbBridge'
+import { openDb, execQuery, getTableNames, getTableInfo, exportDb, advancedSearchRaw, advancedSearchJson, type TableInfo, type QueryExecResult, type AdvancedSearchMatch } from './dbBridge'
 import './App.css'
 
 type SqlResult = QueryExecResult | null
@@ -119,6 +119,12 @@ function App() {
   const [recentList, setRecentList] = useState<{ id: string; filename: string; openedAt: number }[]>([])
   const [error, setError] = useState<string | null>(null)
   const [tableSearch, setTableSearch] = useState('')
+  const [advancedSearchInput, setAdvancedSearchInput] = useState('')
+  const [advancedSearchResults, setAdvancedSearchResults] = useState<AdvancedSearchMatch[] | null>(null)
+  const [advancedSearchLoading, setAdvancedSearchLoading] = useState(false)
+  const [advancedSearchError, setAdvancedSearchError] = useState<string | null>(null)
+  const [advancedSearchJsonCriteria, setAdvancedSearchJsonCriteria] = useState<Record<string, unknown> | null>(null)
+  const [advancedSearchRawValue, setAdvancedSearchRawValue] = useState<string | null>(null)
   const [recentSearch, setRecentSearch] = useState('')
   const [draggingTabId, setDraggingTabId] = useState<string | null>(null)
   const [tabOrder, setTabOrder] = useState<string[]>([])
@@ -237,6 +243,10 @@ function App() {
     setTabs([])
     setTableNamesState([])
     setTableInfosState([])
+    setAdvancedSearchResults(null)
+    setAdvancedSearchError(null)
+    setAdvancedSearchJsonCriteria(null)
+    setAdvancedSearchRawValue(null)
 
     try {
       let dbBytes: Uint8Array
@@ -314,21 +324,63 @@ function App() {
     }
   }
 
-  async function handleTableSelect(tableName: string) {
+  function buildFilterQuery(tableName: string, criteria: Record<string, unknown>): string {
+    const info = tableInfos.find((i) => i.name === tableName)
+    const quotedTable = `"${tableName.replace(/"/g, '""')}"`
+    if (!info) return `SELECT * FROM ${quotedTable} ORDER BY rowid DESC LIMIT ${DEFAULT_ROW_LIMIT};`
+    const sqlLit = (v: unknown): string => {
+      if (v === null || v === undefined) return 'NULL'
+      if (typeof v === 'number') return String(v)
+      if (typeof v === 'boolean') return v ? '1' : '0'
+      return "'" + String(v).replace(/'/g, "''") + "'"
+    }
+    const conditions = Object.entries(criteria)
+      .map(([k, v]) => {
+        const col = info.columns.find((c) => c.toLowerCase() === k.toLowerCase())
+        if (!col) return null
+        return `"${col.replace(/"/g, '""')}" = ${sqlLit(v)}`
+      })
+      .filter((x): x is string => x != null)
+      .join(' AND ')
+    if (!conditions) return `SELECT * FROM ${quotedTable} ORDER BY rowid DESC LIMIT ${DEFAULT_ROW_LIMIT};`
+    return `SELECT * FROM ${quotedTable} WHERE ${conditions} ORDER BY rowid DESC LIMIT ${DEFAULT_ROW_LIMIT};`
+  }
+
+  function buildRawValueFilterQuery(tableName: string, rawValue: string): string {
+    const info = tableInfos.find((i) => i.name === tableName)
+    const quotedTable = `"${tableName.replace(/"/g, '""')}"`
+    if (!info || info.columns.length === 0) return `SELECT * FROM ${quotedTable} ORDER BY rowid DESC LIMIT ${DEFAULT_ROW_LIMIT};`
+    const escapeLike = (s: string) => s.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_')
+    const pattern = '%' + escapeLike(rawValue) + '%'
+    const patternSql = "'" + pattern.replace(/'/g, "''") + "'"
+    const conditions = info.columns
+      .map((col) => `CAST("${col.replace(/"/g, '""')}" AS TEXT) LIKE ${patternSql} ESCAPE '\\'`)
+      .join(' OR ')
+    return `SELECT * FROM ${quotedTable} WHERE (${conditions}) ORDER BY rowid DESC LIMIT ${DEFAULT_ROW_LIMIT};`
+  }
+
+  async function handleTableSelect(
+    tableName: string,
+    options?: { initialQuery?: string; criteria?: Record<string, unknown> }
+  ) {
     if (loadState !== 'ready') return
 
     const existingTab = tabs.find((t): t is TableTab => isTableTab(t) && t.tableName === tableName)
-    if (existingTab) {
+    if (existingTab && !options?.initialQuery) {
       focusPane(existingTab.id)
       return
     }
 
     const quotedTable = `"${tableName.replace(/"/g, '""')}"`
+    const defaultQuery = `SELECT * FROM ${quotedTable} ORDER BY rowid DESC LIMIT ${DEFAULT_ROW_LIMIT};`
+    const query = options?.criteria
+      ? buildFilterQuery(tableName, options.criteria)
+      : options?.initialQuery ?? defaultQuery
+
     const newTabId = `tab-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
     let tableData: SqlResult = null
-    const defaultQuery = `SELECT * FROM ${quotedTable} ORDER BY rowid DESC LIMIT ${DEFAULT_ROW_LIMIT};`
     try {
-      tableData = await execQuery(`SELECT * FROM ${quotedTable} ORDER BY rowid DESC LIMIT ${DEFAULT_ROW_LIMIT};`)
+      tableData = await execQuery(query)
     } catch (err) {
       console.error(err)
     }
@@ -339,7 +391,7 @@ function App() {
       type: 'table',
       tableName,
       tableData,
-      query: defaultQuery,
+      query,
       queryResult: null,
       error: null,
       schemaCollapsed: true,
@@ -353,6 +405,46 @@ function App() {
 
     setTabs((prev) => [...prev, newTab])
     setTabOrder((prev) => [...prev, newTabId])
+  }
+
+  async function runAdvancedSearch() {
+    const raw = advancedSearchInput.trim()
+    if (!raw) {
+      setAdvancedSearchResults(null)
+      setAdvancedSearchError(null)
+      setAdvancedSearchJsonCriteria(null)
+      setAdvancedSearchRawValue(null)
+      return
+    }
+    setAdvancedSearchError(null)
+    setAdvancedSearchLoading(true)
+    setAdvancedSearchResults(null)
+    setAdvancedSearchJsonCriteria(null)
+    setAdvancedSearchRawValue(null)
+    try {
+      let parsed: Record<string, unknown> | null = null
+      if (raw.startsWith('{')) {
+        try {
+          parsed = JSON.parse(raw) as Record<string, unknown>
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            const matches = await advancedSearchJson(parsed)
+            setAdvancedSearchResults(matches)
+            setAdvancedSearchJsonCriteria(parsed)
+            return
+          }
+        } catch {
+          /* not valid JSON, fall back to raw */
+        }
+      }
+      const matches = await advancedSearchRaw(raw)
+      setAdvancedSearchResults(matches)
+      setAdvancedSearchRawValue(raw)
+    } catch (err) {
+      setAdvancedSearchError(err instanceof Error ? err.message : 'Advanced search failed')
+      setAdvancedSearchResults([])
+    } finally {
+      setAdvancedSearchLoading(false)
+    }
   }
 
   function focusPane(tabId: string) {
@@ -859,6 +951,67 @@ function App() {
             <div className="panel-header">
               <h2>Tables</h2>
               <span className="table-count">{tableNames.length}</span>
+            </div>
+            <div className="advanced-search-block">
+              <label className="advanced-search-label">Advanced search</label>
+              <div className="advanced-search-row">
+                <input
+                  type="text"
+                  className="tables-search-input advanced-search-input"
+                  placeholder='Raw value or JSON e.g. {"col":"val"}'
+                  value={advancedSearchInput}
+                  onChange={(e) => {
+                    setAdvancedSearchInput(e.target.value)
+                    setAdvancedSearchError(null)
+                  }}
+                  onKeyDown={(e) => e.key === 'Enter' && runAdvancedSearch()}
+                  aria-label="Advanced search: raw value or JSON"
+                />
+                <button
+                  type="button"
+                  className="advanced-search-button"
+                  onClick={runAdvancedSearch}
+                  disabled={advancedSearchLoading || loadState !== 'ready'}
+                >
+                  {advancedSearchLoading ? '…' : 'Search'}
+                </button>
+              </div>
+              {advancedSearchError && (
+                <p className="advanced-search-error">{advancedSearchError}</p>
+              )}
+              {advancedSearchResults && advancedSearchResults.length > 0 && (
+                <div className="advanced-search-results">
+                  <p className="advanced-search-results-label">
+                    Tables with matching rows (click to open filtered)
+                  </p>
+                  <ul className="advanced-search-list">
+                    {advancedSearchResults.map((m) => (
+                      <li key={m.tableName}>
+                        <button
+                          type="button"
+                          className="advanced-search-result-item"
+                          onClick={() =>
+                            handleTableSelect(
+                              m.tableName,
+                              advancedSearchJsonCriteria
+                                ? { criteria: advancedSearchJsonCriteria }
+                                : advancedSearchRawValue
+                                  ? { initialQuery: buildRawValueFilterQuery(m.tableName, advancedSearchRawValue) }
+                                  : undefined
+                            )
+                          }
+                        >
+                          <span className="advanced-search-table-name">{m.tableName}</span>
+                          <span className="advanced-search-count">{m.matchCount} row{m.matchCount !== 1 ? 's' : ''}</span>
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {advancedSearchResults && advancedSearchResults.length === 0 && advancedSearchInput.trim() && !advancedSearchLoading && (
+                <p className="advanced-search-empty">No tables match</p>
+              )}
             </div>
             <input
               type="search"

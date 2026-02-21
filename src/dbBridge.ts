@@ -14,6 +14,8 @@ export type TableInfo = {
   createStatement: string | null
 }
 
+export type AdvancedSearchMatch = { tableName: string; matchCount: number }
+
 type WorkerOut =
   | { type: 'opened'; id: number }
   | { type: 'error'; id: number; message: string }
@@ -22,6 +24,7 @@ type WorkerOut =
   | { type: 'tableNames'; id: number; names: string[] }
   | { type: 'tableInfo'; id: number; info: TableInfo }
   | { type: 'exported'; id: number; data: Uint8Array }
+  | { type: 'advancedSearchResult'; id: number; matches: AdvancedSearchMatch[] }
 
 let worker: Worker | null = null
 let nextId = 1
@@ -59,6 +62,10 @@ function getWorker(): Worker {
     }
     if (msg.type === 'exported') {
       p.resolve(msg.data)
+      return
+    }
+    if (msg.type === 'advancedSearchResult') {
+      p.resolve(msg.matches)
       return
     }
   }
@@ -111,5 +118,21 @@ export function exportDb(): Promise<Uint8Array> {
   return new Promise((resolve, reject) => {
     pending.set(id, { resolve: resolve as (v: unknown) => void, reject })
     getWorker().postMessage({ type: 'export', id })
+  })
+}
+
+export function advancedSearchRaw(value: string): Promise<AdvancedSearchMatch[]> {
+  const id = nextId++
+  return new Promise((resolve, reject) => {
+    pending.set(id, { resolve: resolve as (v: unknown) => void, reject })
+    getWorker().postMessage({ type: 'advancedSearchRaw', id, value })
+  })
+}
+
+export function advancedSearchJson(criteria: Record<string, unknown>): Promise<AdvancedSearchMatch[]> {
+  const id = nextId++
+  return new Promise((resolve, reject) => {
+    pending.set(id, { resolve: resolve as (v: unknown) => void, reject })
+    getWorker().postMessage({ type: 'advancedSearchJson', id, criteria })
   })
 }
