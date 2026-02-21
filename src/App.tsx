@@ -212,10 +212,17 @@ function App() {
 
   /* tableNames and tableInfos are set by openDbFile after worker opens DB */
 
-  const filteredTableInfos = useMemo(() => {
-    if (!tableSearch.trim()) return tableInfos
+  const { filteredTableInfos, tablesByColumnMatch } = useMemo(() => {
+    if (!tableSearch.trim()) {
+      return { filteredTableInfos: tableInfos, tablesByColumnMatch: [] as TableInfo[] }
+    }
     const q = tableSearch.trim().toLowerCase()
-    return tableInfos.filter((info) => info.name.toLowerCase().includes(q))
+    const byColumn = tableInfos.filter((info) =>
+      info.columns.some((col) => col.toLowerCase().includes(q))
+    )
+    const byName = tableInfos.filter((info) => info.name.toLowerCase().includes(q))
+    const combined = [...new Map([...byColumn, ...byName].map((info) => [info.name, info])).values()]
+    return { filteredTableInfos: combined, tablesByColumnMatch: byColumn }
   }, [tableInfos, tableSearch])
 
   const filteredRecentList = useMemo(() => {
@@ -856,15 +863,20 @@ function App() {
             <input
               type="search"
               className="tables-search-input"
-              placeholder="Search tables…"
+              placeholder="Search tables or columns…"
               value={tableSearch}
               onChange={(e) => setTableSearch(e.target.value)}
-              aria-label="Search tables"
+              aria-label="Search tables or columns"
             />
+            {tableSearch.trim() && tablesByColumnMatch.length > 0 && (
+              <p className="tables-column-hint">
+                Tables with column matching &quot;{tableSearch.trim()}&quot;
+              </p>
+            )}
             <div className="tables-list">
               {filteredTableInfos.length === 0 ? (
                 <p className="tables-empty">
-                  {tableSearch.trim() ? 'No matching tables' : 'No tables'}
+                  {tableSearch.trim() ? 'No matching tables or columns' : 'No tables'}
                 </p>
               ) : (
                 filteredTableInfos.map((info) => {
