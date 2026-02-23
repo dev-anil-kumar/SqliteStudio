@@ -138,7 +138,15 @@ self.onmessage = async (e: MessageEvent<InMessage>) => {
 
     if (msg.type === 'exec') {
       const result = db.exec(msg.query)
-      const serialized = result.map((r: { columns: string[]; values: unknown[][] }) => ({ columns: r.columns, values: r.values }))
+      let serialized = result.map((r: { columns: string[]; values: unknown[][] }) => ({ columns: r.columns, values: r.values }))
+      // For DML/DDL (UPDATE, DELETE, INSERT, CREATE, etc.) there are no result rows; show changes() and last_insert_rowid()
+      const first = serialized[0]
+      if (!first || first.columns.length === 0) {
+        const changeRes = db.exec('SELECT changes() AS changes, last_insert_rowid() AS last_insert_rowid')
+        if (changeRes[0] && changeRes[0].columns.length > 0) {
+          serialized = [{ columns: changeRes[0].columns, values: changeRes[0].values }]
+        }
+      }
       self.postMessage({ type: 'result', id: msg.id, result: serialized })
       return
     }

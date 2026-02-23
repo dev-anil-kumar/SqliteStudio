@@ -75,6 +75,22 @@ async function loadFileAsBuffer(file: File): Promise<ArrayBuffer> {
   })
 }
 
+const DIRECT_DB_EXTENSIONS = ['.vyp', '.db']
+const ARCHIVE_EXTENSIONS = ['.vyb', '.zip']
+
+function isDirectDbFile(filename: string): boolean {
+  const lower = filename.toLowerCase()
+  return DIRECT_DB_EXTENSIONS.some((ext) => lower.endsWith(ext))
+}
+
+function isAcceptedFile(filename: string): boolean {
+  const lower = filename.toLowerCase()
+  return (
+    ARCHIVE_EXTENSIONS.some((ext) => lower.endsWith(ext)) ||
+    DIRECT_DB_EXTENSIONS.some((ext) => lower.endsWith(ext))
+  )
+}
+
 async function extractVypFromZip(buffer: ArrayBuffer): Promise<{
   vypBytes: Uint8Array
   vypName: string
@@ -194,7 +210,7 @@ function App() {
     return () => document.removeEventListener('click', close)
   }, [openPaneMenuId])
 
-  /* tableNames and tableInfos are set by processVybBuffer after worker opens DB */
+  /* tableNames and tableInfos are set by openDbFile after worker opens DB */
 
   const filteredTableInfos = useMemo(() => {
     if (!tableSearch.trim()) return tableInfos
@@ -208,7 +224,7 @@ function App() {
     return recentList.filter((e) => e.filename.toLowerCase().includes(q))
   }, [recentList, recentSearch])
 
-  async function processVybBuffer(buffer: ArrayBuffer, filename: string) {
+  async function openDbFile(buffer: ArrayBuffer, filename: string) {
     setLoadState('loading')
     setError(null)
     setTabs([])
@@ -216,20 +232,33 @@ function App() {
     setTableInfosState([])
 
     try {
-      const baseName = filename.toLowerCase().endsWith('.vyb')
-        ? filename.slice(0, -4)
-        : filename.replace(/\.[^/.]+$/, '')
+      let dbBytes: Uint8Array
+      let dbName: string
+      let downloadFilename: string
 
-      const { vypBytes, vypName } = await extractVypFromZip(buffer)
-      await openDb(vypBytes)
+      if (isDirectDbFile(filename)) {
+        dbBytes = new Uint8Array(buffer)
+        dbName = filename
+        downloadFilename = filename
+      } else {
+        const baseName = filename.toLowerCase().endsWith('.vyb')
+          ? filename.slice(0, -4)
+          : filename.replace(/\.[^/.]+$/, '')
+        const { vypBytes, vypName } = await extractVypFromZip(buffer)
+        dbBytes = vypBytes
+        dbName = vypName
+        downloadFilename = `${baseName}.vyb`
+      }
+
+      await openDb(dbBytes)
 
       const names = await getTableNames()
       const infos = await Promise.all(names.map((name) => getTableInfo(name)))
 
       setTableNamesState(names)
       setTableInfosState(infos)
-      setDbFilename(vypName)
-      setVybFilename(`${baseName}.vyb`)
+      setDbFilename(dbName)
+      setVybFilename(downloadFilename)
       setLoadState('ready')
       saveRecentDb(filename, buffer).catch(() => {})
     } catch (err) {
@@ -243,7 +272,7 @@ function App() {
     setError(null)
     try {
       const { filename, data } = await loadRecentDb(id)
-      await processVybBuffer(data, filename)
+      await openDbFile(data, filename)
     } catch (err) {
       console.error(err)
       setLoadState('error')
@@ -252,9 +281,10 @@ function App() {
   }
 
   async function handleFileUpload(file: File) {
+    if (!isAcceptedFile(file.name)) return
     try {
       const buffer = await loadFileAsBuffer(file)
-      await processVybBuffer(buffer, file.name)
+      await openDbFile(buffer, file.name)
     } catch (err) {
       console.error(err)
       setLoadState('error')
@@ -390,12 +420,9 @@ function App() {
     a.rel = 'noopener'
     a.style.display = 'none'
     document.body.appendChild(a)
-    // Defer click so it runs after current event; ensures download in all browsers when triggered from menu
-    setTimeout(() => {
-      a.click()
-      document.body.removeChild(a)
-      setTimeout(() => URL.revokeObjectURL(url), 1000)
-    }, 0)
+    a.click()
+    document.body.removeChild(a)
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
 
   function exportQueryResultsAsJson(tabId: string) {
@@ -437,19 +464,25 @@ function App() {
     return [header, ...lines].join('\n')
   }
 
-  async function copyQueryResultsAsCsv(tabId: string) {
+  async function copyQueryResultsAsJson(tabId: string) {
     const tab = tabs.find((t): t is TableTab => t.id === tabId && isTableTab(t))
     if (!tab) return
     const data = getTabResultData(tab)
     if (!data || data.values.length === 0) return
-    const csv = buildCsvFromResult(data)
+    const rows = data.values.map((row) => {
+      const obj: Record<string, unknown> = {}
+      data.columns.forEach((col, i) => {
+        obj[col] = row[i]
+      })
+      return obj
+    })
+    const json = JSON.stringify(rows, null, 2)
     try {
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        await navigator.clipboard.writeText(csv)
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(json)
       } else {
-        // Fallback for very old browsers: use a hidden textarea
         const textarea = document.createElement('textarea')
-        textarea.value = csv
+        textarea.value = json
         textarea.style.position = 'fixed'
         textarea.style.left = '-9999px'
         document.body.appendChild(textarea)
@@ -642,15 +675,23 @@ function App() {
     }
   }
 
-  async function handleDownloadUpdatedVyb() {
+  async function handleDownloadDatabase() {
     if (loadState !== 'ready') return
     try {
       const data = await exportDb()
-      const zip = new JSZip()
-      const filename = dbFilename ?? 'database.vyp'
-      zip.file(filename, data)
-      const blob = await zip.generateAsync({ type: 'blob' })
-      downloadBlob(blob, vybFilename ?? 'database.vyb')
+      const name = vybFilename ?? 'database'
+      const lower = name.toLowerCase()
+      // If opened from .vyb (archive), download as zip; otherwise download raw .vyp/.db
+      if (lower.endsWith('.vyb')) {
+        const zip = new JSZip()
+        zip.file(dbFilename ?? 'database.vyp', data)
+        const blob = await zip.generateAsync({ type: 'blob' })
+        downloadBlob(blob, name)
+      } else {
+        const blob = new Blob([data], { type: 'application/octet-stream' })
+        const downloadName = (name.endsWith('.vyp') || name.endsWith('.db')) ? name : 'database.vyp'
+        downloadBlob(blob, downloadName)
+      }
     } catch (err) {
       console.error(err)
     }
@@ -674,7 +715,7 @@ function App() {
     setIsDragging(false)
 
     const file = e.dataTransfer.files?.[0]
-    if (file && (file.name.toLowerCase().endsWith('.vyb') || file.name.toLowerCase().endsWith('.zip'))) {
+    if (file && isAcceptedFile(file.name)) {
       handleFileUpload(file)
     }
   }
@@ -685,7 +726,7 @@ function App() {
         <div className="app-header-inner">
           <h1>VYB SQLite Studio</h1>
           <p className="subtitle">
-            Open a <code>.vyb</code> archive to browse and edit the internal SQLite database in your browser.
+            Open a <code>.vyb</code>, <code>.vyp</code>, <code>.db</code>, or <code>.zip</code> file to browse and edit the SQLite database in your browser.
           </p>
         </div>
         <div className="theme-toggle-wrap">
@@ -752,7 +793,7 @@ function App() {
 
             <div className="upload-block">
               <h2 className="upload-title">
-                {recentList.length > 0 ? 'Open another file' : 'Open a .vyb file'}
+                {recentList.length > 0 ? 'Open another file' : 'Open a database file'}
               </h2>
               <div
                 className={`drop-zone ${isDragging ? 'dragging' : ''}`}
@@ -774,7 +815,7 @@ function App() {
                     <polyline points="17 8 12 3 7 8" />
                     <line x1="12" y1="3" x2="12" y2="15" />
                   </svg>
-                  <p className="drop-text">Drop a .vyb file here</p>
+                  <p className="drop-text">Drop a .vyb, .vyp, .db, or .zip file here</p>
                   <p className="drop-sub">or</p>
                   <button
                     type="button"
@@ -787,7 +828,7 @@ function App() {
                   <input
                     ref={fileInputRef}
                     type="file"
-                    accept=".vyb,.zip"
+                    accept=".vyb,.zip,.vyp,.db"
                     onChange={handleFileInputChange}
                     disabled={loadState === 'loading'}
                     style={{ display: 'none' }}
@@ -858,10 +899,10 @@ function App() {
               </button>
               <button
                 type="button"
-                onClick={handleDownloadUpdatedVyb}
+                onClick={handleDownloadDatabase}
                 className="download-button"
               >
-                💾 Download .vyb
+                💾 Download
               </button>
             </div>
           </aside>
@@ -1074,10 +1115,10 @@ function App() {
                                 </button>
                                 <button
                                   type="button"
-                                  onClick={() => copyQueryResultsAsCsv(tab.id)}
+                                  onClick={() => copyQueryResultsAsJson(tab.id)}
                                   disabled={!getTabResultData(tab) || getTabResultData(tab)!.values.length === 0}
                                 >
-                                  Copy results to clipboard
+                                  Copy as JSON (clipboard)
                                 </button>
                               </div>
                             )}
