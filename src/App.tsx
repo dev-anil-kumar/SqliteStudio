@@ -1,17 +1,66 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import JSZip from 'jszip'
 import { getRecentList, loadRecentDb, saveRecentDb, formatRecentDate } from './recentDb'
-import { openDb, execQuery, getTableNames, getTableInfo, exportDb, advancedSearchRaw, advancedSearchJson, type TableInfo, type QueryExecResult, type AdvancedSearchMatch } from './dbBridge'
+import {
+  openDb,
+  execQuery,
+  getTableNames,
+  getTableInfo,
+  getDbInfo,
+  exportDb,
+  searchAllTables,
+  searchJsonCriteria,
+  type TableInfo,
+  type DbInfo,
+  type QueryExecResult,
+  type SearchMatch,
+} from './dbBridge'
+import {
+  FILTER_OPS,
+  OP_META,
+  buildCount,
+  buildGlobalWhere,
+  buildJsonCriteriaWhere,
+  buildSelect,
+  buildWhereClause,
+  opTakesValue,
+  type FilterCondition,
+  type FilterOp,
+  type FilterOptions,
+  type GlobalSearchMode,
+} from './filters'
+import {
+  ACCEPTED_EXTENSIONS,
+  fetchDbFromUrl,
+  formatBytes,
+  resolveDb,
+} from './dbSource'
 import './App.css'
 
 type SqlResult = QueryExecResult | null
 
 type LoadState = 'idle' | 'loading' | 'ready' | 'error'
 
-const DEFAULT_PANE_WIDTH = 560
-const DEFAULT_PANE_HEIGHT = 560
+const DEFAULT_PANE_WIDTH = 620
+const DEFAULT_PANE_HEIGHT = 600
 const PANE_OFFSET = 28
 const DEFAULT_ROW_LIMIT = 20
+const DEFAULT_FILTER_LIMIT = 50
+const DEFAULT_EDIT_DISTANCE = 2
+
+/** Which secondary panel is expanded in a table pane; null keeps the pane compact. */
+type PanePanel = 'filter' | 'sql' | 'schema' | null
+
+type FilterRow = FilterCondition & { id: string }
+
+type TableFilter = {
+  rows: FilterRow[]
+  join: 'AND' | 'OR'
+  caseSensitive: boolean
+  distance: number
+  limit: number
+  advanced: boolean
+}
 
 type TableTab = {
   id: string
@@ -20,9 +69,11 @@ type TableTab = {
   tableData: SqlResult
   query: string
   queryResult: SqlResult
+  /** Total rows matching the last applied filter, independent of the row limit. */
+  matchCount: number | null
+  filter: TableFilter
+  panel: PanePanel
   error: string | null
-  schemaCollapsed: boolean
-  keysCollapsed: boolean
   x: number
   y: number
   width: number
@@ -40,10 +91,31 @@ type SavedQueriesTab = {
   zIndex: number
 }
 
-type Tab = TableTab | SavedQueriesTab
+type DbInfoTab = {
+  id: string
+  type: 'db-info'
+  x: number
+  y: number
+  width: number
+  height: number
+  zIndex: number
+}
+
+type Tab = TableTab | SavedQueriesTab | DbInfoTab
 
 function isTableTab(tab: Tab): tab is TableTab {
   return tab.type === 'table'
+}
+
+type SourceInfo = {
+  /** Name of the container the user opened (file, archive or URL basename). */
+  filename: string
+  /** Name of the SQLite file itself — the inner entry for archives. */
+  dbName: string
+  downloadName: string
+  fromArchive: boolean
+  sourceBytes: number
+  url: string | null
 }
 
 type SavedQuery = { id: string; name: string; sql: string }
@@ -75,42 +147,43 @@ async function loadFileAsBuffer(file: File): Promise<ArrayBuffer> {
   })
 }
 
-const DIRECT_DB_EXTENSIONS = ['.vyp', '.db']
-const ARCHIVE_EXTENSIONS = ['.vyb', '.zip']
-
-function isDirectDbFile(filename: string): boolean {
-  const lower = filename.toLowerCase()
-  return DIRECT_DB_EXTENSIONS.some((ext) => lower.endsWith(ext))
+function newId(prefix: string): string {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`
 }
 
-function isAcceptedFile(filename: string): boolean {
-  const lower = filename.toLowerCase()
-  return (
-    ARCHIVE_EXTENSIONS.some((ext) => lower.endsWith(ext)) ||
-    DIRECT_DB_EXTENSIONS.some((ext) => lower.endsWith(ext))
-  )
+function makeFilterRow(column: string, op: FilterOp = 'contains'): FilterRow {
+  return { id: newId('cond'), column, op, value: '' }
 }
 
-async function extractVypFromZip(buffer: ArrayBuffer): Promise<{
-  vypBytes: Uint8Array
-  vypName: string
-}> {
-  const zip = await JSZip.loadAsync(buffer)
-
-  const entries = Object.values(zip.files)
-  const vypEntry = entries.find((f) => f.name.toLowerCase().endsWith('.vyp'))
-
-  if (!vypEntry) {
-    throw new Error('No .vyp file found inside .vyb (zip) archive')
+function makeDefaultFilter(info: TableInfo | undefined): TableFilter {
+  return {
+    rows: [makeFilterRow(info?.columns[0] ?? '')],
+    join: 'AND',
+    caseSensitive: false,
+    distance: DEFAULT_EDIT_DISTANCE,
+    limit: DEFAULT_FILTER_LIMIT,
+    advanced: false,
   }
-
-  const arrayBuffer = await vypEntry.async('arraybuffer')
-  return { vypBytes: new Uint8Array(arrayBuffer), vypName: vypEntry.name }
 }
+
+const BASIC_OPS = FILTER_OPS.filter((o) => !o.advanced)
+const ADVANCED_OPS = FILTER_OPS.filter((o) => o.advanced)
+
+const SEARCH_MODES: { value: GlobalSearchMode; label: string; advanced: boolean }[] = [
+  { value: 'contains', label: 'contains', advanced: false },
+  { value: 'exact', label: 'exact', advanced: false },
+  { value: 'regex', label: 'regex', advanced: true },
+  { value: 'fuzzy', label: 'fuzzy', advanced: true },
+]
+
+/** What the last global search ran, so a result click can rebuild its WHERE. */
+type AppliedSearch =
+  | { kind: 'value'; value: string; mode: GlobalSearchMode; options: FilterOptions; column: string }
+  | { kind: 'json'; criteria: Record<string, unknown> }
 
 function App() {
-  const [dbFilename, setDbFilename] = useState<string | null>(null)
-  const [vybFilename, setVybFilename] = useState<string | null>(null)
+  const [source, setSource] = useState<SourceInfo | null>(null)
+  const [dbInfo, setDbInfo] = useState<DbInfo | null>(null)
   const [loadState, setLoadState] = useState<LoadState>('idle')
   const [tableNames, setTableNamesState] = useState<string[]>([])
   const [tableInfos, setTableInfosState] = useState<TableInfo[]>([])
@@ -119,12 +192,20 @@ function App() {
   const [recentList, setRecentList] = useState<{ id: string; filename: string; openedAt: number }[]>([])
   const [error, setError] = useState<string | null>(null)
   const [tableSearch, setTableSearch] = useState('')
-  const [advancedSearchInput, setAdvancedSearchInput] = useState('')
-  const [advancedSearchResults, setAdvancedSearchResults] = useState<AdvancedSearchMatch[] | null>(null)
-  const [advancedSearchLoading, setAdvancedSearchLoading] = useState(false)
-  const [advancedSearchError, setAdvancedSearchError] = useState<string | null>(null)
-  const [advancedSearchJsonCriteria, setAdvancedSearchJsonCriteria] = useState<Record<string, unknown> | null>(null)
-  const [advancedSearchRawValue, setAdvancedSearchRawValue] = useState<string | null>(null)
+
+  const [urlInput, setUrlInput] = useState('')
+
+  const [searchValue, setSearchValue] = useState('')
+  const [searchMode, setSearchMode] = useState<GlobalSearchMode>('contains')
+  const [searchColumn, setSearchColumn] = useState('')
+  const [searchCaseSensitive, setSearchCaseSensitive] = useState(false)
+  const [searchDistance, setSearchDistance] = useState(DEFAULT_EDIT_DISTANCE)
+  const [searchAdvanced, setSearchAdvanced] = useState(false)
+  const [searchResults, setSearchResults] = useState<SearchMatch[] | null>(null)
+  const [searchLoading, setSearchLoading] = useState(false)
+  const [searchError, setSearchError] = useState<string | null>(null)
+  const [appliedSearch, setAppliedSearch] = useState<AppliedSearch | null>(null)
+
   const [recentSearch, setRecentSearch] = useState('')
   const [draggingTabId, setDraggingTabId] = useState<string | null>(null)
   const [tabOrder, setTabOrder] = useState<string[]>([])
@@ -146,6 +227,7 @@ function App() {
   const [canvasViewport, setCanvasViewport] = useState({ width: 0, height: 0 })
   const dragRafRef = useRef<number | null>(null)
   const dragPendingRef = useRef<{ tabId: string; x: number; y: number } | null>(null)
+  const deepLinkHandledRef = useRef(false)
 
   useEffect(() => {
     try {
@@ -216,8 +298,6 @@ function App() {
     return () => document.removeEventListener('click', close)
   }, [openPaneMenuId])
 
-  /* tableNames and tableInfos are set by openDbFile after worker opens DB */
-
   const { filteredTableInfos, tablesByColumnMatch } = useMemo(() => {
     if (!tableSearch.trim()) {
       return { filteredTableInfos: tableInfos, tablesByColumnMatch: [] as TableInfo[] }
@@ -237,52 +317,93 @@ function App() {
     return recentList.filter((e) => e.filename.toLowerCase().includes(q))
   }, [recentList, recentSearch])
 
-  async function openDbFile(buffer: ArrayBuffer, filename: string) {
-    setLoadState('loading')
-    setError(null)
-    setTabs([])
-    setTableNamesState([])
-    setTableInfosState([])
-    setAdvancedSearchResults(null)
-    setAdvancedSearchError(null)
-    setAdvancedSearchJsonCriteria(null)
-    setAdvancedSearchRawValue(null)
+  const totalRows = useMemo(
+    () => tableInfos.reduce((sum, info) => sum + info.rowCount, 0),
+    [tableInfos]
+  )
 
-    try {
-      let dbBytes: Uint8Array
-      let dbName: string
-      let downloadFilename: string
-
-      if (isDirectDbFile(filename)) {
-        dbBytes = new Uint8Array(buffer)
-        dbName = filename
-        downloadFilename = filename
-      } else {
-        const baseName = filename.toLowerCase().endsWith('.vyb')
-          ? filename.slice(0, -4)
-          : filename.replace(/\.[^/.]+$/, '')
-        const { vypBytes, vypName } = await extractVypFromZip(buffer)
-        dbBytes = vypBytes
-        dbName = vypName
-        downloadFilename = `${baseName}.vyb`
-      }
-
-      await openDb(dbBytes)
-
-      const names = await getTableNames()
-      const infos = await Promise.all(names.map((name) => getTableInfo(name)))
-
-      setTableNamesState(names)
-      setTableInfosState(infos)
-      setDbFilename(dbName)
-      setVybFilename(downloadFilename)
-      setLoadState('ready')
-      saveRecentDb(filename, buffer).catch(() => {})
-    } catch (err) {
-      console.error(err)
-      setLoadState('error')
-    }
+  function resetSearchState() {
+    setSearchResults(null)
+    setSearchError(null)
+    setAppliedSearch(null)
   }
+
+  const openDbFile = useCallback(
+    async function openDbFile(buffer: ArrayBuffer, filename: string, url: string | null = null) {
+      setLoadState('loading')
+      setError(null)
+      setTabs([])
+      setTableNamesState([])
+      setTableInfosState([])
+      setDbInfo(null)
+      setSearchResults(null)
+      setSearchError(null)
+      setAppliedSearch(null)
+
+      try {
+        const resolved = await resolveDb(buffer, filename)
+
+        // openDb transfers the buffer; keep an intact copy for the recents store.
+        const recentBuffer =
+          resolved.bytes.buffer === buffer ? buffer.slice(0) : buffer
+
+        await openDb(resolved.bytes)
+
+        const names = await getTableNames()
+        const infos = await Promise.all(names.map((name) => getTableInfo(name)))
+        const info = await getDbInfo().catch(() => null)
+
+        setTableNamesState(names)
+        setTableInfosState(infos)
+        setDbInfo(info)
+        setSource({
+          filename,
+          dbName: resolved.dbName,
+          downloadName: resolved.downloadName,
+          fromArchive: resolved.fromArchive,
+          sourceBytes: resolved.sourceBytes,
+          url,
+        })
+        setLoadState('ready')
+        saveRecentDb(filename, recentBuffer).catch(() => {})
+      } catch (err) {
+        console.error(err)
+        setError(err instanceof Error ? err.message : 'Failed to open database')
+        setLoadState('error')
+      }
+    },
+    []
+  )
+
+  const openFromUrl = useCallback(
+    async function openFromUrl(rawUrl: string) {
+      const url = rawUrl.trim()
+      if (!url) return
+      setLoadState('loading')
+      setError(null)
+      try {
+        const { buffer, filename } = await fetchDbFromUrl(url)
+        await openDbFile(buffer, filename, url)
+      } catch (err) {
+        console.error(err)
+        setError(err instanceof Error ? err.message : 'Failed to open URL')
+        setLoadState('error')
+      }
+    },
+    [openDbFile]
+  )
+
+  // ?url=… (or ?db=…) opens a remote database straight away.
+  useEffect(() => {
+    if (deepLinkHandledRef.current) return
+    deepLinkHandledRef.current = true
+    const params = new URLSearchParams(window.location.search)
+    const deepLink = params.get('url') ?? params.get('db')
+    if (deepLink) {
+      setUrlInput(deepLink)
+      openFromUrl(deepLink)
+    }
+  }, [openFromUrl])
 
   async function openRecentDb(id: string) {
     setLoadState('loading')
@@ -298,21 +419,19 @@ function App() {
   }
 
   async function handleFileUpload(file: File) {
-    if (!isAcceptedFile(file.name)) return
     try {
       const buffer = await loadFileAsBuffer(file)
       await openDbFile(buffer, file.name)
     } catch (err) {
       console.error(err)
+      setError(err instanceof Error ? err.message : 'Failed to read file')
       setLoadState('error')
     }
   }
 
   function handleFileInputChange(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
-    if (file) {
-      handleFileUpload(file)
-    }
+    if (file) handleFileUpload(file)
   }
 
   function persistSavedQueries(next: SavedQuery[]) {
@@ -324,45 +443,31 @@ function App() {
     }
   }
 
-  function buildFilterQuery(tableName: string, criteria: Record<string, unknown>): string {
-    const info = tableInfos.find((i) => i.name === tableName)
-    const quotedTable = `"${tableName.replace(/"/g, '""')}"`
-    if (!info) return `SELECT * FROM ${quotedTable} ORDER BY rowid DESC LIMIT ${DEFAULT_ROW_LIMIT};`
-    const sqlLit = (v: unknown): string => {
-      if (v === null || v === undefined) return 'NULL'
-      if (typeof v === 'number') return String(v)
-      if (typeof v === 'boolean') return v ? '1' : '0'
-      return "'" + String(v).replace(/'/g, "''") + "'"
+  function infoFor(tableName: string): TableInfo | undefined {
+    return tableInfos.find((i) => i.name === tableName)
+  }
+
+  function defaultQueryFor(tableName: string): string {
+    const info = infoFor(tableName)
+    return buildSelect(tableName, null, DEFAULT_ROW_LIMIT, info?.hasRowid ?? true)
+  }
+
+  /** Rebuilds the WHERE the last global search used, for one specific table. */
+  function whereForAppliedSearch(tableName: string): string | null {
+    if (!appliedSearch) return null
+    const info = infoFor(tableName)
+    if (!info) return null
+    if (appliedSearch.kind === 'json') {
+      return buildJsonCriteriaWhere(info.columns, appliedSearch.criteria)
     }
-    const conditions = Object.entries(criteria)
-      .map(([k, v]) => {
-        const col = info.columns.find((c) => c.toLowerCase() === k.toLowerCase())
-        if (!col) return null
-        return `"${col.replace(/"/g, '""')}" = ${sqlLit(v)}`
-      })
-      .filter((x): x is string => x != null)
-      .join(' AND ')
-    if (!conditions) return `SELECT * FROM ${quotedTable} ORDER BY rowid DESC LIMIT ${DEFAULT_ROW_LIMIT};`
-    return `SELECT * FROM ${quotedTable} WHERE ${conditions} ORDER BY rowid DESC LIMIT ${DEFAULT_ROW_LIMIT};`
+    const needle = appliedSearch.column.trim().toLowerCase()
+    const columns = needle
+      ? info.columns.filter((c) => c.toLowerCase().includes(needle))
+      : info.columns
+    return buildGlobalWhere(columns, appliedSearch.value, appliedSearch.mode, appliedSearch.options)
   }
 
-  function buildRawValueFilterQuery(tableName: string, rawValue: string): string {
-    const info = tableInfos.find((i) => i.name === tableName)
-    const quotedTable = `"${tableName.replace(/"/g, '""')}"`
-    if (!info || info.columns.length === 0) return `SELECT * FROM ${quotedTable} ORDER BY rowid DESC LIMIT ${DEFAULT_ROW_LIMIT};`
-    const escapeLike = (s: string) => s.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_')
-    const pattern = '%' + escapeLike(rawValue) + '%'
-    const patternSql = "'" + pattern.replace(/'/g, "''") + "'"
-    const conditions = info.columns
-      .map((col) => `CAST("${col.replace(/"/g, '""')}" AS TEXT) LIKE ${patternSql} ESCAPE '\\'`)
-      .join(' OR ')
-    return `SELECT * FROM ${quotedTable} WHERE (${conditions}) ORDER BY rowid DESC LIMIT ${DEFAULT_ROW_LIMIT};`
-  }
-
-  async function handleTableSelect(
-    tableName: string,
-    options?: { initialQuery?: string; criteria?: Record<string, unknown> }
-  ) {
+  async function handleTableSelect(tableName: string, options?: { initialQuery?: string }) {
     if (loadState !== 'ready') return
 
     const existingTab = tabs.find((t): t is TableTab => isTableTab(t) && t.tableName === tableName)
@@ -371,18 +476,17 @@ function App() {
       return
     }
 
-    const quotedTable = `"${tableName.replace(/"/g, '""')}"`
-    const defaultQuery = `SELECT * FROM ${quotedTable} ORDER BY rowid DESC LIMIT ${DEFAULT_ROW_LIMIT};`
-    const query = options?.criteria
-      ? buildFilterQuery(tableName, options.criteria)
-      : options?.initialQuery ?? defaultQuery
+    const info = infoFor(tableName)
+    const query = options?.initialQuery ?? defaultQueryFor(tableName)
 
-    const newTabId = `tab-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+    const newTabId = newId('tab')
     let tableData: SqlResult = null
+    let queryError: string | null = null
     try {
       tableData = await execQuery(query)
     } catch (err) {
       console.error(err)
+      queryError = err instanceof Error ? err.message : 'Failed to run query'
     }
 
     const maxZ = tabs.length === 0 ? 0 : Math.max(...tabs.map((t) => t.zIndex))
@@ -393,9 +497,10 @@ function App() {
       tableData,
       query,
       queryResult: null,
-      error: null,
-      schemaCollapsed: true,
-      keysCollapsed: true,
+      matchCount: null,
+      filter: makeDefaultFilter(info),
+      panel: 'filter',
+      error: queryError,
       x: 20 + tabs.length * PANE_OFFSET,
       y: 20 + tabs.length * PANE_OFFSET,
       width: DEFAULT_PANE_WIDTH,
@@ -407,54 +512,76 @@ function App() {
     setTabOrder((prev) => [...prev, newTabId])
   }
 
-  async function runAdvancedSearch() {
-    const raw = advancedSearchInput.trim()
+  function openTableFromSearch(tableName: string) {
+    const where = whereForAppliedSearch(tableName)
+    const info = infoFor(tableName)
+    const query = where
+      ? buildSelect(tableName, where, DEFAULT_FILTER_LIMIT, info?.hasRowid ?? true)
+      : defaultQueryFor(tableName)
+    handleTableSelect(tableName, { initialQuery: query })
+  }
+
+  async function runGlobalSearch() {
+    const raw = searchValue.trim()
     if (!raw) {
-      setAdvancedSearchResults(null)
-      setAdvancedSearchError(null)
-      setAdvancedSearchJsonCriteria(null)
-      setAdvancedSearchRawValue(null)
+      resetSearchState()
       return
     }
-    setAdvancedSearchError(null)
-    setAdvancedSearchLoading(true)
-    setAdvancedSearchResults(null)
-    setAdvancedSearchJsonCriteria(null)
-    setAdvancedSearchRawValue(null)
+    setSearchError(null)
+    setSearchLoading(true)
+    setSearchResults(null)
+    setAppliedSearch(null)
     try {
-      let parsed: Record<string, unknown> | null = null
+      // A JSON object means "match these columns exactly".
       if (raw.startsWith('{')) {
+        let parsed: Record<string, unknown> | null = null
         try {
-          parsed = JSON.parse(raw) as Record<string, unknown>
-          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-            const matches = await advancedSearchJson(parsed)
-            setAdvancedSearchResults(matches)
-            setAdvancedSearchJsonCriteria(parsed)
-            return
+          const candidate = JSON.parse(raw) as unknown
+          if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
+            parsed = candidate as Record<string, unknown>
           }
         } catch {
-          /* not valid JSON, fall back to raw */
+          /* not JSON — fall through to a plain value search */
+        }
+        if (parsed) {
+          const matches = await searchJsonCriteria(parsed)
+          setSearchResults(matches)
+          setAppliedSearch({ kind: 'json', criteria: parsed })
+          return
         }
       }
-      const matches = await advancedSearchRaw(raw)
-      setAdvancedSearchResults(matches)
-      setAdvancedSearchRawValue(raw)
+
+      const options: FilterOptions = {
+        caseSensitive: searchCaseSensitive,
+        distance: searchDistance,
+      }
+      const matches = await searchAllTables(raw, searchMode, options, searchColumn)
+      setSearchResults(matches)
+      setAppliedSearch({
+        kind: 'value',
+        value: raw,
+        mode: searchMode,
+        options,
+        column: searchColumn,
+      })
     } catch (err) {
-      setAdvancedSearchError(err instanceof Error ? err.message : 'Advanced search failed')
-      setAdvancedSearchResults([])
+      setSearchError(err instanceof Error ? err.message : 'Search failed')
+      setSearchResults([])
     } finally {
-      setAdvancedSearchLoading(false)
+      setSearchLoading(false)
     }
   }
 
   function focusPane(tabId: string) {
     const maxZ = Math.max(...tabs.map((t) => t.zIndex))
     setTabs((prev) =>
-      prev.map((tab) =>
-        tab.id === tabId ? { ...tab, zIndex: maxZ + 1 } : tab
-      )
+      prev.map((tab) => (tab.id === tabId ? { ...tab, zIndex: maxZ + 1 } : tab))
     )
     paneRefs.current[tabId]?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+  }
+
+  function nextPanePosition() {
+    return { x: 20 + tabs.length * PANE_OFFSET, y: 20 + tabs.length * PANE_OFFSET }
   }
 
   function openSavedQueriesPane() {
@@ -463,19 +590,40 @@ function App() {
       focusPane(existing.id)
       return
     }
-    const newTabId = `saved-queries-${Date.now()}`
     const maxZ = tabs.length === 0 ? 0 : Math.max(...tabs.map((t) => t.zIndex))
+    const { x, y } = nextPanePosition()
     const newTab: SavedQueriesTab = {
-      id: newTabId,
+      id: newId('saved-queries'),
       type: 'saved-queries',
-      x: 20 + tabs.length * PANE_OFFSET,
-      y: 20 + tabs.length * PANE_OFFSET,
+      x,
+      y,
       width: 380,
       height: 420,
       zIndex: maxZ + 1,
     }
     setTabs((prev) => [...prev, newTab])
-    setTabOrder((prev) => [...prev, newTabId])
+    setTabOrder((prev) => [...prev, newTab.id])
+  }
+
+  function openDbInfoPane() {
+    const existing = tabs.find((t) => t.type === 'db-info')
+    if (existing) {
+      focusPane(existing.id)
+      return
+    }
+    const maxZ = tabs.length === 0 ? 0 : Math.max(...tabs.map((t) => t.zIndex))
+    const { x, y } = nextPanePosition()
+    const newTab: DbInfoTab = {
+      id: newId('db-info'),
+      type: 'db-info',
+      x,
+      y,
+      width: 460,
+      height: 520,
+      zIndex: maxZ + 1,
+    }
+    setTabs((prev) => [...prev, newTab])
+    setTabOrder((prev) => [...prev, newTab.id])
   }
 
   function handleSaveQuery(tabId: string) {
@@ -483,11 +631,7 @@ function App() {
     if (!tab || !isTableTab(tab)) return
     const name = window.prompt('Name for this query')
     if (!name?.trim()) return
-    const newItem: SavedQuery = {
-      id: `sq-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-      name: name.trim(),
-      sql: tab.query,
-    }
+    const newItem: SavedQuery = { id: newId('sq'), name: name.trim(), sql: tab.query }
     persistSavedQueries([...savedQueries, newItem])
   }
 
@@ -495,6 +639,7 @@ function App() {
     const tab = tabs.find((t) => t.id === tabId)
     if (!tab || !isTableTab(tab)) return
     handleQueryChange(tabId, sql)
+    setPanePanel(tabId, 'sql')
     focusPane(tabId)
   }
 
@@ -524,21 +669,23 @@ function App() {
     setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
 
-  function exportQueryResultsAsJson(tabId: string) {
-    const tab = tabs.find((t): t is TableTab => t.id === tabId && isTableTab(t))
-    if (!tab) return
-    const data = getTabResultData(tab)
-    if (!data || data.values.length === 0) return
-    const rows = data.values.map((row) => {
+  function resultToRows(data: QueryExecResult): Record<string, unknown>[] {
+    return data.values.map((row) => {
       const obj: Record<string, unknown> = {}
       data.columns.forEach((col, i) => {
         obj[col] = row[i]
       })
       return obj
     })
-    const json = JSON.stringify(rows, null, 2)
-    const blob = new Blob([json], { type: 'application/json' })
-    downloadBlob(blob, `${tab.tableName}-results.json`)
+  }
+
+  function exportQueryResultsAsJson(tabId: string) {
+    const tab = tabs.find((t): t is TableTab => t.id === tabId && isTableTab(t))
+    if (!tab) return
+    const data = getTabResultData(tab)
+    if (!data || data.values.length === 0) return
+    const json = JSON.stringify(resultToRows(data), null, 2)
+    downloadBlob(new Blob([json], { type: 'application/json' }), `${tab.tableName}-results.json`)
     setTimeout(() => setOpenPaneMenuId(null), 0)
   }
 
@@ -547,9 +694,7 @@ function App() {
     if (!tab) return
     const data = getTabResultData(tab)
     if (!data || data.values.length === 0) return
-    const csv = buildCsvFromResult(data)
-    const blob = new Blob([csv], { type: 'text/csv' })
-    downloadBlob(blob, `${tab.tableName}-results.csv`)
+    downloadBlob(new Blob([buildCsvFromResult(data)], { type: 'text/csv' }), `${tab.tableName}-results.csv`)
     setTimeout(() => setOpenPaneMenuId(null), 0)
   }
 
@@ -568,14 +713,7 @@ function App() {
     if (!tab) return
     const data = getTabResultData(tab)
     if (!data || data.values.length === 0) return
-    const rows = data.values.map((row) => {
-      const obj: Record<string, unknown> = {}
-      data.columns.forEach((col, i) => {
-        obj[col] = row[i]
-      })
-      return obj
-    })
-    const json = JSON.stringify(rows, null, 2)
+    const json = JSON.stringify(resultToRows(data), null, 2)
     try {
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(json)
@@ -620,9 +758,7 @@ function App() {
     setTabs((prev) => {
       const maxZ = Math.max(...prev.map((t) => t.zIndex))
       return prev.map((tab) =>
-        tab.id === tabId
-          ? { ...tab, x: Math.max(0, x), y: Math.max(0, y), zIndex: maxZ + 1 }
-          : tab
+        tab.id === tabId ? { ...tab, x: Math.max(0, x), y: Math.max(0, y), zIndex: maxZ + 1 } : tab
       )
     })
   }
@@ -634,10 +770,7 @@ function App() {
     const el = paneRefs.current[tabId]
     if (el) {
       const rect = el.getBoundingClientRect()
-      dragOffsetRef.current = {
-        x: e.clientX - rect.left,
-        y: e.clientY - rect.top,
-      }
+      dragOffsetRef.current = { x: e.clientX - rect.left, y: e.clientY - rect.top }
     } else {
       dragOffsetRef.current = { x: 0, y: 0 }
     }
@@ -686,14 +819,10 @@ function App() {
 
   function updatePaneSize(tabId: string, width: number, height: number) {
     const w = Math.max(320, Math.round(width))
-    const h = Math.max(420, Math.round(height))
+    const h = Math.max(360, Math.round(height))
     setTabs((prev) => {
-      const next = prev.map((tab) =>
-        tab.id === tabId ? { ...tab, width: w, height: h } : tab
-      )
-      const changed = prev.some(
-        (t) => t.id === tabId && (t.width !== w || t.height !== h)
-      )
+      const next = prev.map((tab) => (tab.id === tabId ? { ...tab, width: w, height: h } : tab))
+      const changed = prev.some((t) => t.id === tabId && (t.width !== w || t.height !== h))
       return changed ? next : prev
     })
   }
@@ -702,10 +831,7 @@ function App() {
     if (tabs.length === 0) return { width: 0, height: 0 }
     const right = Math.max(...tabs.map((t) => t.x + t.width))
     const bottom = Math.max(...tabs.map((t) => t.y + t.height))
-    return {
-      width: Math.max(right + 120, 800),
-      height: Math.max(bottom + 120, 600),
-    }
+    return { width: Math.max(right + 120, 800), height: Math.max(bottom + 120, 600) }
   }, [tabs])
 
   const innerSize = useMemo(
@@ -716,28 +842,101 @@ function App() {
     [canvasSize.width, canvasSize.height, canvasViewport.width, canvasViewport.height]
   )
 
-  function toggleSchemaCollapsed(tabId: string) {
-    setTabs(
-      tabs.map((t) =>
-        t.id === tabId && isTableTab(t) ? { ...t, schemaCollapsed: !t.schemaCollapsed } : t
-      )
+  /* ---------- table pane: panels + filter builder ---------- */
+
+  function updateTableTab(tabId: string, patch: (tab: TableTab) => Partial<TableTab>) {
+    setTabs((prev) =>
+      prev.map((t) => (t.id === tabId && isTableTab(t) ? { ...t, ...patch(t) } : t))
     )
   }
 
-  function toggleKeysCollapsed(tabId: string) {
-    setTabs(
-      tabs.map((t) =>
-        t.id === tabId && isTableTab(t) ? { ...t, keysCollapsed: !t.keysCollapsed } : t
-      )
-    )
+  function setPanePanel(tabId: string, panel: PanePanel) {
+    updateTableTab(tabId, (tab) => ({ panel: tab.panel === panel ? null : panel }))
+  }
+
+  function updateFilter(tabId: string, patch: (filter: TableFilter) => Partial<TableFilter>) {
+    updateTableTab(tabId, (tab) => ({ filter: { ...tab.filter, ...patch(tab.filter) } }))
+  }
+
+  function updateFilterRow(tabId: string, rowId: string, patch: Partial<FilterRow>) {
+    updateFilter(tabId, (filter) => ({
+      rows: filter.rows.map((r) => (r.id === rowId ? { ...r, ...patch } : r)),
+    }))
+  }
+
+  function addFilterRow(tabId: string) {
+    const tab = tabs.find((t): t is TableTab => t.id === tabId && isTableTab(t))
+    if (!tab) return
+    const info = infoFor(tab.tableName)
+    updateFilter(tabId, (filter) => ({
+      rows: [...filter.rows, makeFilterRow(info?.columns[0] ?? '')],
+    }))
+  }
+
+  function removeFilterRow(tabId: string, rowId: string) {
+    updateFilter(tabId, (filter) => ({
+      rows: filter.rows.length <= 1 ? filter.rows : filter.rows.filter((r) => r.id !== rowId),
+    }))
+  }
+
+  function filterOptionsOf(filter: TableFilter): FilterOptions {
+    return { caseSensitive: filter.caseSensitive, distance: filter.distance }
+  }
+
+  async function applyFilter(tabId: string) {
+    const tab = tabs.find((t): t is TableTab => t.id === tabId && isTableTab(t))
+    if (!tab || loadState !== 'ready') return
+    const info = infoFor(tab.tableName)
+    const opts = filterOptionsOf(tab.filter)
+    const where = buildWhereClause(tab.filter.rows, tab.filter.join, opts)
+    const query = buildSelect(tab.tableName, where, tab.filter.limit, info?.hasRowid ?? true)
+
+    updateTableTab(tabId, () => ({ query, error: null }))
+
+    try {
+      const rows = await execQuery(query)
+      let matchCount: number | null = null
+      if (where) {
+        const countRes = await execQuery(buildCount(tab.tableName, where))
+        const raw = countRes?.values?.[0]?.[0]
+        matchCount = raw != null ? Number(raw) : null
+      }
+      updateTableTab(tabId, () => ({
+        tableData: rows,
+        queryResult: null,
+        matchCount,
+        error: null,
+      }))
+    } catch (err) {
+      console.error(err)
+      updateTableTab(tabId, () => ({
+        error: err instanceof Error ? err.message : 'Filter failed',
+        queryResult: null,
+      }))
+    }
+  }
+
+  async function resetFilter(tabId: string) {
+    const tab = tabs.find((t): t is TableTab => t.id === tabId && isTableTab(t))
+    if (!tab) return
+    const info = infoFor(tab.tableName)
+    const query = defaultQueryFor(tab.tableName)
+    updateTableTab(tabId, () => ({
+      filter: makeDefaultFilter(info),
+      query,
+      matchCount: null,
+      error: null,
+    }))
+    try {
+      const rows = await execQuery(query)
+      updateTableTab(tabId, () => ({ tableData: rows, queryResult: null }))
+    } catch (err) {
+      console.error(err)
+    }
   }
 
   function handleQueryChange(tabId: string, query: string) {
-    setTabs(
-      tabs.map((t) =>
-        t.id === tabId && isTableTab(t) ? { ...t, query, error: null } : t
-      )
-    )
+    updateTableTab(tabId, () => ({ query, error: null }))
   }
 
   async function handleExecuteQuery(tabId: string) {
@@ -745,55 +944,49 @@ function App() {
     const tab = tabs.find((t) => t.id === tabId)
     if (!tab || !isTableTab(tab)) return
 
-    setTabs((prev) =>
-      prev.map((t) =>
-        t.id === tabId ? { ...t, error: null, queryResult: null } : t
-      )
-    )
+    updateTableTab(tabId, () => ({ error: null, queryResult: null }))
 
     try {
       const res = await execQuery(tab.query)
-      setTabs((prev) =>
-        prev.map((t) =>
-          t.id === tabId ? { ...t, queryResult: res ?? null, error: null } : t
-        )
-      )
+      updateTableTab(tabId, () => ({ queryResult: res ?? null, error: null, matchCount: null }))
     } catch (err) {
       console.error(err)
-      setTabs((prev) =>
-        prev.map((t) =>
-          t.id === tabId
-            ? {
-                ...t,
-                error: err instanceof Error ? err.message : 'Failed to execute SQL query',
-                queryResult: null,
-              }
-            : t
-        )
-      )
+      updateTableTab(tabId, () => ({
+        error: err instanceof Error ? err.message : 'Failed to execute SQL query',
+        queryResult: null,
+      }))
     }
   }
 
   async function handleDownloadDatabase() {
-    if (loadState !== 'ready') return
+    if (loadState !== 'ready' || !source) return
     try {
       const data = await exportDb()
-      const name = vybFilename ?? 'database'
-      const lower = name.toLowerCase()
-      // If opened from .vyb (archive), download as zip; otherwise download raw .vyp/.db
-      if (lower.endsWith('.vyb')) {
+      const name = source.downloadName || 'database.vyp'
+      if (source.fromArchive) {
         const zip = new JSZip()
-        zip.file(dbFilename ?? 'database.vyp', data)
+        zip.file(source.dbName || 'database.vyp', data)
         const blob = await zip.generateAsync({ type: 'blob' })
         downloadBlob(blob, name)
       } else {
-        const blob = new Blob([data], { type: 'application/octet-stream' })
-        const downloadName = (name.endsWith('.vyp') || name.endsWith('.db')) ? name : 'database.vyp'
-        downloadBlob(blob, downloadName)
+        downloadBlob(new Blob([data], { type: 'application/octet-stream' }), name)
       }
     } catch (err) {
       console.error(err)
     }
+  }
+
+  function closeDatabase() {
+    setLoadState('idle')
+    setTabs([])
+    setTabOrder([])
+    setTableNamesState([])
+    setTableInfosState([])
+    setDbInfo(null)
+    setSource(null)
+    setTableSearch('')
+    setSearchValue('')
+    resetSearchState()
   }
 
   function handleDragOver(e: React.DragEvent) {
@@ -812,12 +1005,306 @@ function App() {
     e.preventDefault()
     e.stopPropagation()
     setIsDragging(false)
-
     const file = e.dataTransfer.files?.[0]
-    if (file && isAcceptedFile(file.name)) {
-      handleFileUpload(file)
-    }
+    if (file) handleFileUpload(file)
   }
+
+  /* ---------- render helpers ---------- */
+
+  function renderResultTable(data: QueryExecResult) {
+    return (
+      <div className="table-wrapper">
+        <table>
+          <thead>
+            <tr>
+              {data.columns.map((col: string) => (
+                <th key={col}>{col}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {data.values.length === 0 ? (
+              <tr>
+                <td colSpan={Math.max(1, data.columns.length)} className="empty-cell">
+                  No rows match
+                </td>
+              </tr>
+            ) : (
+              data.values.map((row: unknown[], i: number) => (
+                <tr key={i}>
+                  {row.map((cell: unknown, j: number) => (
+                    <td key={j} title={cell != null ? String(cell) : undefined}>
+                      {cell != null ? String(cell) : <em>null</em>}
+                    </td>
+                  ))}
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+    )
+  }
+
+  function renderFilterPanel(tab: TableTab, info: TableInfo | undefined) {
+    const columns = info?.columns ?? []
+    return (
+      <div className="filter-panel">
+        <div className="filter-rows">
+          {tab.filter.rows.map((row, idx) => {
+            const meta = OP_META[row.op]
+            return (
+              <div className="filter-row" key={row.id}>
+                {idx === 0 ? (
+                  <span className="filter-join filter-join-static">Where</span>
+                ) : (
+                  <button
+                    type="button"
+                    className="filter-join"
+                    onClick={() =>
+                      updateFilter(tab.id, (f) => ({ join: f.join === 'AND' ? 'OR' : 'AND' }))
+                    }
+                    title="Toggle AND / OR"
+                  >
+                    {tab.filter.join}
+                  </button>
+                )}
+                <select
+                  className="filter-col"
+                  value={row.column}
+                  onChange={(e) => updateFilterRow(tab.id, row.id, { column: e.target.value })}
+                  aria-label="Column"
+                >
+                  {columns.map((c) => (
+                    <option key={c} value={c}>
+                      {c}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  className="filter-op"
+                  value={row.op}
+                  onChange={(e) =>
+                    updateFilterRow(tab.id, row.id, { op: e.target.value as FilterOp })
+                  }
+                  aria-label="Operator"
+                >
+                  <optgroup label="Basic">
+                    {BASIC_OPS.map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </optgroup>
+                  {(tab.filter.advanced || OP_META[row.op]?.advanced) && (
+                    <optgroup label="Advanced">
+                      {ADVANCED_OPS.map((o) => (
+                        <option key={o.value} value={o.value}>
+                          {o.label}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
+                </select>
+                {opTakesValue(row.op) ? (
+                  <input
+                    className="filter-value"
+                    value={row.value}
+                    placeholder={meta?.hint ?? 'Value'}
+                    title={meta?.hint}
+                    onChange={(e) => updateFilterRow(tab.id, row.id, { value: e.target.value })}
+                    onKeyDown={(e) => e.key === 'Enter' && applyFilter(tab.id)}
+                    aria-label="Value"
+                  />
+                ) : (
+                  <span className="filter-value filter-value-none">—</span>
+                )}
+                <button
+                  type="button"
+                  className="filter-remove"
+                  onClick={() => removeFilterRow(tab.id, row.id)}
+                  disabled={tab.filter.rows.length <= 1}
+                  aria-label="Remove condition"
+                >
+                  ✕
+                </button>
+              </div>
+            )
+          })}
+        </div>
+
+        <div className="filter-actions">
+          <button type="button" className="filter-add" onClick={() => addFilterRow(tab.id)}>
+            + Condition
+          </button>
+          <label className="filter-toggle">
+            <input
+              type="checkbox"
+              checked={tab.filter.advanced}
+              onChange={(e) => updateFilter(tab.id, () => ({ advanced: e.target.checked }))}
+            />
+            Advanced
+          </label>
+          <span className="filter-actions-spacer" />
+          <button type="button" className="filter-reset" onClick={() => resetFilter(tab.id)}>
+            Reset
+          </button>
+          <button type="button" className="filter-apply" onClick={() => applyFilter(tab.id)}>
+            Search
+          </button>
+        </div>
+
+        {tab.filter.advanced && (
+          <div className="filter-advanced">
+            <label className="filter-toggle">
+              <input
+                type="checkbox"
+                checked={tab.filter.caseSensitive}
+                onChange={(e) =>
+                  updateFilter(tab.id, () => ({ caseSensitive: e.target.checked }))
+                }
+              />
+              Case sensitive
+            </label>
+            <label className="filter-number">
+              Max edit distance
+              <input
+                type="number"
+                min={0}
+                max={10}
+                value={tab.filter.distance}
+                onChange={(e) =>
+                  updateFilter(tab.id, () => ({ distance: Number(e.target.value) || 0 }))
+                }
+              />
+            </label>
+            <label className="filter-number">
+              Row limit
+              <input
+                type="number"
+                min={1}
+                max={5000}
+                value={tab.filter.limit}
+                onChange={(e) =>
+                  updateFilter(tab.id, () => ({ limit: Number(e.target.value) || 1 }))
+                }
+              />
+            </label>
+            <p className="filter-hint">
+              Advanced unlocks LIKE patterns, regex and fuzzy (edit-distance) matching in the
+              operator list.
+            </p>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  function renderSchemaPanel(info: TableInfo) {
+    return (
+      <div className="schema-panel">
+        {(info.primaryKey.length > 0 || info.foreignKeys.length > 0) && (
+          <div className="keys-content">
+            {info.primaryKey.length > 0 && (
+              <div className="keys-block">
+                <span className="keys-label">Primary key</span>
+                <div className="keys-list">
+                  {info.primaryKey.map((col, idx) => (
+                    <span key={idx} className="key-badge key-pk">
+                      {col}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+            {info.foreignKeys.length > 0 && (
+              <div className="keys-block">
+                <span className="keys-label">Foreign keys</span>
+                <ul className="fk-list">
+                  {info.foreignKeys.map((fk, idx) => (
+                    <li key={idx} className="fk-item">
+                      <span className="key-badge key-fk-from">{fk.from}</span>
+                      <span className="fk-arrow">→</span>
+                      <span className="key-badge key-fk-to">
+                        {fk.toTable}({fk.toColumn})
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        )}
+        <div className="keys-block">
+          <span className="keys-label">Columns</span>
+          <div className="column-grid">
+            {info.columnDetails.map((c) => (
+              <div key={c.name} className="column-chip">
+                <span className="column-chip-name">{c.name}</span>
+                <span className="column-chip-type">{c.type || 'ANY'}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+        {info.createStatement && (
+          <div className="keys-block">
+            <span className="keys-label">CREATE statement</span>
+            <pre className="create-statement">{info.createStatement}</pre>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  function renderDbInfoPane() {
+    const rows: [string, string][] = [
+      ['File', source?.filename ?? '—'],
+      ...(source?.fromArchive ? ([['Database inside', source.dbName]] as [string, string][]) : []),
+      ['Source', source?.url ? source.url : 'Local file'],
+      ['Container size', source ? formatBytes(source.sourceBytes) : '—'],
+      ['Database size', dbInfo ? formatBytes(dbInfo.sizeBytes) : '—'],
+      ['SQLite version', dbInfo?.sqliteVersion ?? '—'],
+      ['Encoding', dbInfo?.encoding ?? '—'],
+      ['Page size', dbInfo ? `${dbInfo.pageSize} B × ${dbInfo.pageCount.toLocaleString()} pages` : '—'],
+      ['Journal mode', dbInfo?.journalMode ?? '—'],
+      ['User version', dbInfo ? String(dbInfo.userVersion) : '—'],
+      ['Tables', String(tableInfos.length)],
+      ['Views', dbInfo ? String(dbInfo.viewCount) : '—'],
+      ['Indexes', dbInfo ? String(dbInfo.indexCount) : '—'],
+      ['Triggers', dbInfo ? String(dbInfo.triggerCount) : '—'],
+      ['Total rows', totalRows.toLocaleString()],
+    ]
+    const biggest = [...tableInfos].sort((a, b) => b.rowCount - a.rowCount).slice(0, 8)
+    return (
+      <div className="db-info-pane">
+        <dl className="db-info-grid">
+          {rows.map(([label, value]) => (
+            <div key={label} className="db-info-row">
+              <dt>{label}</dt>
+              <dd title={value}>{value}</dd>
+            </div>
+          ))}
+        </dl>
+        {biggest.length > 0 && (
+          <div className="db-info-tables">
+            <h4>Largest tables</h4>
+            <ul>
+              {biggest.map((t) => (
+                <li key={t.name}>
+                  <button type="button" onClick={() => handleTableSelect(t.name)}>
+                    <span className="db-info-table-name">{t.name}</span>
+                    <span className="db-info-table-rows">{t.rowCount.toLocaleString()} rows</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  const acceptAttr = ACCEPTED_EXTENSIONS.join(',')
 
   return (
     <div className="app-root" data-theme={theme}>
@@ -825,7 +1312,9 @@ function App() {
         <div className="app-header-inner">
           <h1>VYB SQLite Studio</h1>
           <p className="subtitle">
-            Open a <code>.vyb</code>, <code>.vyp</code>, <code>.db</code>, or <code>.zip</code> file to browse and edit the SQLite database in your browser.
+            Open a <code>.vyb</code>, <code>.vyp</code>, <code>.db</code>, or <code>.zip</code> —
+            from your machine or a URL — to browse, search and edit the SQLite database in your
+            browser.
           </p>
         </div>
         <div className="theme-toggle-wrap">
@@ -927,103 +1416,193 @@ function App() {
                   <input
                     ref={fileInputRef}
                     type="file"
-                    accept=".vyb,.zip,.vyp,.db"
+                    accept={acceptAttr}
                     onChange={handleFileInputChange}
                     disabled={loadState === 'loading'}
                     style={{ display: 'none' }}
                   />
                 </div>
               </div>
+
+              <div className="url-block">
+                <h3 className="url-title">Open from URL</h3>
+                <div className="url-row">
+                  <input
+                    type="url"
+                    className="url-input"
+                    placeholder="https://example.com/backup.vyb"
+                    value={urlInput}
+                    onChange={(e) => setUrlInput(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && openFromUrl(urlInput)}
+                    disabled={loadState === 'loading'}
+                    aria-label="Database URL"
+                  />
+                  <button
+                    type="button"
+                    className="url-button"
+                    onClick={() => openFromUrl(urlInput)}
+                    disabled={loadState === 'loading' || !urlInput.trim()}
+                  >
+                    {loadState === 'loading' ? 'Opening…' : 'Open'}
+                  </button>
+                </div>
+                <p className="url-hint">
+                  Works with <code>.vyp</code>, <code>.vyb</code> and <code>.zip</code> links. The
+                  host must allow cross-origin (CORS) reads. You can also deep-link this page with{' '}
+                  <code>?url=…</code>.
+                </p>
+              </div>
             </div>
           </div>
 
-          {error && (
-            <div className="error-banner main-error">
-              {error}
-            </div>
-          )}
+          {error && <div className="error-banner main-error">{error}</div>}
         </section>
       )}
 
       {loadState === 'ready' && (
         <main className="app-main-with-sidebar">
           <aside className="tables-sidebar">
-            <div className="panel-header">
-              <h2>Tables</h2>
-              <span className="table-count">{tableNames.length}</span>
+            <div className="db-summary">
+              <div className="db-summary-name" title={source?.filename ?? ''}>
+                {source?.url ? '🌐' : '📄'} {source?.filename ?? 'database'}
+              </div>
+              <div className="db-summary-meta">
+                {tableInfos.length} tables · {totalRows.toLocaleString()} rows
+                {dbInfo ? ` · ${formatBytes(dbInfo.sizeBytes)}` : ''}
+              </div>
+              <div className="db-summary-actions">
+                <button type="button" onClick={openDbInfoPane}>
+                  Details
+                </button>
+                <button type="button" onClick={closeDatabase}>
+                  Close
+                </button>
+              </div>
             </div>
-            <div className="advanced-search-block">
-              <label className="advanced-search-label">Advanced search</label>
-              <div className="advanced-search-row">
+
+            <div className="search-block">
+              <div className="search-block-head">
+                <label className="search-label" htmlFor="global-search">
+                  Search all tables
+                </label>
+                <button
+                  type="button"
+                  className={`search-advanced-toggle ${searchAdvanced ? 'active' : ''}`}
+                  onClick={() => setSearchAdvanced((v) => !v)}
+                  aria-expanded={searchAdvanced}
+                >
+                  Advanced
+                </button>
+              </div>
+              <div className="search-row">
                 <input
+                  id="global-search"
                   type="text"
-                  className="tables-search-input advanced-search-input"
-                  placeholder='Raw value or JSON e.g. {"col":"val"}'
-                  value={advancedSearchInput}
+                  className="tables-search-input search-input"
+                  placeholder={'Value, or JSON {"col":"val"}'}
+                  value={searchValue}
                   onChange={(e) => {
-                    setAdvancedSearchInput(e.target.value)
-                    setAdvancedSearchError(null)
+                    setSearchValue(e.target.value)
+                    setSearchError(null)
                   }}
-                  onKeyDown={(e) => e.key === 'Enter' && runAdvancedSearch()}
-                  aria-label="Advanced search: raw value or JSON"
+                  onKeyDown={(e) => e.key === 'Enter' && runGlobalSearch()}
+                  aria-label="Search value across all tables"
                 />
                 <button
                   type="button"
-                  className="advanced-search-button"
-                  onClick={runAdvancedSearch}
-                  disabled={advancedSearchLoading || loadState !== 'ready'}
+                  className="search-button"
+                  onClick={runGlobalSearch}
+                  disabled={searchLoading || loadState !== 'ready'}
                 >
-                  {advancedSearchLoading ? '…' : 'Search'}
+                  {searchLoading ? '…' : 'Search'}
                 </button>
               </div>
-              {advancedSearchError && (
-                <p className="advanced-search-error">{advancedSearchError}</p>
+              <div className="search-modes">
+                {SEARCH_MODES.filter((m) => !m.advanced || searchAdvanced).map((m) => (
+                  <button
+                    key={m.value}
+                    type="button"
+                    className={`search-mode ${searchMode === m.value ? 'active' : ''}`}
+                    onClick={() => setSearchMode(m.value)}
+                  >
+                    {m.label}
+                  </button>
+                ))}
+              </div>
+              {searchAdvanced && (
+                <div className="search-advanced">
+                  <input
+                    type="text"
+                    className="search-column-input"
+                    placeholder="Only columns named like…"
+                    value={searchColumn}
+                    onChange={(e) => setSearchColumn(e.target.value)}
+                    aria-label="Restrict to columns whose name contains"
+                  />
+                  <label className="filter-toggle">
+                    <input
+                      type="checkbox"
+                      checked={searchCaseSensitive}
+                      onChange={(e) => setSearchCaseSensitive(e.target.checked)}
+                    />
+                    Case sensitive
+                  </label>
+                  {searchMode === 'fuzzy' && (
+                    <label className="filter-number">
+                      Max edit distance
+                      <input
+                        type="number"
+                        min={0}
+                        max={10}
+                        value={searchDistance}
+                        onChange={(e) => setSearchDistance(Number(e.target.value) || 0)}
+                      />
+                    </label>
+                  )}
+                </div>
               )}
-              {advancedSearchResults && advancedSearchResults.length > 0 && (
-                <div className="advanced-search-results">
-                  <p className="advanced-search-results-label">
-                    Tables with matching rows (click to open filtered)
-                  </p>
-                  <ul className="advanced-search-list">
-                    {advancedSearchResults.map((m) => (
+              {searchError && <p className="search-error">{searchError}</p>}
+              {searchResults && searchResults.length > 0 && (
+                <div className="search-results">
+                  <p className="search-results-label">Click a table to open it filtered</p>
+                  <ul className="search-list">
+                    {searchResults.map((m) => (
                       <li key={m.tableName}>
                         <button
                           type="button"
-                          className="advanced-search-result-item"
-                          onClick={() =>
-                            handleTableSelect(
-                              m.tableName,
-                              advancedSearchJsonCriteria
-                                ? { criteria: advancedSearchJsonCriteria }
-                                : advancedSearchRawValue
-                                  ? { initialQuery: buildRawValueFilterQuery(m.tableName, advancedSearchRawValue) }
-                                  : undefined
-                            )
-                          }
+                          className="search-result-item"
+                          onClick={() => openTableFromSearch(m.tableName)}
                         >
-                          <span className="advanced-search-table-name">{m.tableName}</span>
-                          <span className="advanced-search-count">{m.matchCount} row{m.matchCount !== 1 ? 's' : ''}</span>
+                          <span className="search-table-name">{m.tableName}</span>
+                          <span className="search-count">
+                            {m.matchCount.toLocaleString()} row{m.matchCount !== 1 ? 's' : ''}
+                          </span>
                         </button>
                       </li>
                     ))}
                   </ul>
                 </div>
               )}
-              {advancedSearchResults && advancedSearchResults.length === 0 && advancedSearchInput.trim() && !advancedSearchLoading && (
-                <p className="advanced-search-empty">No tables match</p>
+              {searchResults && searchResults.length === 0 && !searchLoading && searchValue.trim() && (
+                <p className="search-empty">No tables match</p>
               )}
+            </div>
+
+            <div className="panel-header">
+              <h2>Tables</h2>
+              <span className="table-count">{tableNames.length}</span>
             </div>
             <input
               type="search"
               className="tables-search-input"
-              placeholder="Search tables or columns…"
+              placeholder="Filter tables or columns…"
               value={tableSearch}
               onChange={(e) => setTableSearch(e.target.value)}
-              aria-label="Search tables or columns"
+              aria-label="Filter tables or columns"
             />
             {tableSearch.trim() && tablesByColumnMatch.length > 0 && (
               <p className="tables-column-hint">
-                Tables with column matching &quot;{tableSearch.trim()}&quot;
+                Tables with a column matching &quot;{tableSearch.trim()}&quot;
               </p>
             )}
             <div className="tables-list">
@@ -1033,40 +1612,32 @@ function App() {
                 </p>
               ) : (
                 filteredTableInfos.map((info) => {
-                const isOpen = tabs.some((t) => isTableTab(t) && t.tableName === info.name)
-                return (
-                  <button
-                    key={info.name}
-                    className={`table-item ${isOpen ? 'open' : ''}`}
-                    onClick={() => handleTableSelect(info.name)}
-                  >
-                    <div className="table-item-header">
-                      <span className="table-icon">📊</span>
-                      <span className="table-name">{info.name}</span>
-                      {isOpen && <span className="tab-indicator">●</span>}
-                    </div>
-                    <div className="table-item-meta">
-                      <span className="table-rows">{info.rowCount.toLocaleString()} rows</span>
-                      <span className="table-cols">{info.columns.length} cols</span>
-                    </div>
-                  </button>
-                )
-              })
+                  const isOpen = tabs.some((t) => isTableTab(t) && t.tableName === info.name)
+                  return (
+                    <button
+                      key={info.name}
+                      className={`table-item ${isOpen ? 'open' : ''}`}
+                      onClick={() => handleTableSelect(info.name)}
+                    >
+                      <div className="table-item-header">
+                        <span className="table-icon">📊</span>
+                        <span className="table-name">{info.name}</span>
+                        {isOpen && <span className="tab-indicator">●</span>}
+                      </div>
+                      <div className="table-item-meta">
+                        <span className="table-rows">{info.rowCount.toLocaleString()} rows</span>
+                        <span className="table-cols">{info.columns.length} cols</span>
+                      </div>
+                    </button>
+                  )
+                })
               )}
             </div>
             <div className="panel-footer">
-              <button
-                type="button"
-                onClick={openSavedQueriesPane}
-                className="saved-queries-button"
-              >
+              <button type="button" onClick={openSavedQueriesPane} className="saved-queries-button">
                 📌 Saved Queries
               </button>
-              <button
-                type="button"
-                onClick={handleDownloadDatabase}
-                className="download-button"
-              >
+              <button type="button" onClick={handleDownloadDatabase} className="download-button">
                 💾 Download
               </button>
             </div>
@@ -1078,7 +1649,12 @@ function App() {
                 {tabOrder.map((id) => {
                   const tab = tabs.find((t) => t.id === id)
                   if (!tab) return null
-                  const label = tab.type === 'saved-queries' ? 'Saved Queries' : isTableTab(tab) ? tab.tableName : id
+                  const label =
+                    tab.type === 'saved-queries'
+                      ? 'Saved Queries'
+                      : tab.type === 'db-info'
+                        ? 'Database'
+                        : tab.tableName
                   return (
                     <div
                       key={id}
@@ -1098,8 +1674,7 @@ function App() {
                         e.preventDefault()
                         const dragId = e.dataTransfer.getData('text/plain')
                         if (!dragId || dragId === id) return
-                        const toIndex = tabOrder.indexOf(id)
-                        reorderTabBar(dragId, toIndex)
+                        reorderTabBar(dragId, tabOrder.indexOf(id))
                         setDraggingTabBarId(null)
                       }}
                       onClick={() => focusPane(id)}
@@ -1124,62 +1699,72 @@ function App() {
                 <div className="empty-state">
                   <div className="empty-icon">👈</div>
                   <h2>Open a table</h2>
-                  <p className="muted">Click a table on the left to open it in a new pane. Multiple panes show side by side.</p>
+                  <p className="muted">
+                    Click a table on the left to open it in a pane, or search a value across every
+                    table to find where it lives.
+                  </p>
                 </div>
               )}
               <div
                 className="panes-canvas-inner"
-                style={{
-                  minWidth: innerSize.minWidth,
-                  minHeight: innerSize.minHeight,
-                }}
+                style={{ minWidth: innerSize.minWidth, minHeight: innerSize.minHeight }}
               >
                 {tabs.map((tab) => {
-                    if (tab.type === 'saved-queries') {
-                      return (
+                  const paneStyle: React.CSSProperties = {
+                    position: 'absolute',
+                    left: tab.x,
+                    top: tab.y,
+                    width: tab.width,
+                    height: tab.height,
+                    zIndex: tab.zIndex,
+                  }
+
+                  if (tab.type === 'saved-queries' || tab.type === 'db-info') {
+                    const isSaved = tab.type === 'saved-queries'
+                    return (
+                      <div
+                        key={tab.id}
+                        ref={(el) => {
+                          paneRefs.current[tab.id] = el
+                        }}
+                        className={`pane-card ${draggingTabId === tab.id ? 'pane-dragging' : ''}`}
+                        style={paneStyle}
+                      >
                         <div
-                          key={tab.id}
-                          ref={(el) => {
-                            paneRefs.current[tab.id] = el
-                          }}
-                          className={`pane-card ${draggingTabId === tab.id ? 'pane-dragging' : ''}`}
-                          style={{
-                            position: 'absolute',
-                            left: tab.x,
-                            top: tab.y,
-                            width: tab.width,
-                            height: tab.height,
-                            zIndex: tab.zIndex,
-                          }}
+                          className="pane-header pane-drag-handle"
+                          onPointerDown={(e) => handlePanePointerDown(e, tab.id)}
+                          title="Drag to move"
                         >
-                          <div
-                            className="pane-header pane-drag-handle"
-                            onPointerDown={(e) => handlePanePointerDown(e, tab.id)}
-                            title="Drag to move"
+                          <span className="pane-drag-grip" aria-hidden>
+                            ⋮⋮
+                          </span>
+                          <h3 className="pane-title">
+                            <span className="table-icon">{isSaved ? '📌' : 'ⓘ'}</span>
+                            {isSaved ? 'Saved Queries' : 'Database'}
+                          </h3>
+                          <button
+                            className="pane-close"
+                            onClick={(e) => handleCloseTab(tab.id, e)}
+                            onPointerDown={(e) => e.stopPropagation()}
+                            aria-label="Close pane"
                           >
-                            <span className="pane-drag-grip" aria-hidden>⋮⋮</span>
-                            <h3 className="pane-title">
-                              <span className="table-icon">📌</span>
-                              Saved Queries
-                            </h3>
-                            <button
-                              className="pane-close"
-                              onClick={(e) => handleCloseTab(tab.id, e)}
-                              onPointerDown={(e) => e.stopPropagation()}
-                              aria-label="Close pane"
-                            >
-                              ✕
-                            </button>
-                          </div>
+                            ✕
+                          </button>
+                        </div>
+                        {isSaved ? (
                           <div className="saved-queries-pane-content">
                             {savedQueries.length === 0 ? (
-                              <p className="muted">No saved queries. Save a query from a table pane.</p>
+                              <p className="muted">
+                                No saved queries. Save one from a table pane's SQL panel.
+                              </p>
                             ) : (
                               <ul className="saved-queries-list">
                                 {savedQueries.map((sq) => (
                                   <li key={sq.id} className="saved-query-item">
                                     <div className="saved-query-name">{sq.name}</div>
-                                    <pre className="saved-query-sql">{sq.sql.length > 120 ? sq.sql.slice(0, 120) + '…' : sq.sql}</pre>
+                                    <pre className="saved-query-sql">
+                                      {sq.sql.length > 120 ? sq.sql.slice(0, 120) + '…' : sq.sql}
+                                    </pre>
                                     <div className="saved-query-actions">
                                       <button
                                         type="button"
@@ -1213,33 +1798,40 @@ function App() {
                               </ul>
                             )}
                           </div>
-                        </div>
-                      )
-                    }
-                    if (!isTableTab(tab)) return null
-                    const tableInfo = tableInfos.find((t) => t.name === tab.tableName)
-                    return (
+                        ) : (
+                          renderDbInfoPane()
+                        )}
+                      </div>
+                    )
+                  }
+
+                  const tableInfo = infoFor(tab.tableName)
+                  const shown = getTabResultData(tab)
+                  const shownCount = shown?.values.length ?? 0
+                  const totalLabel =
+                    tab.matchCount != null
+                      ? `${shownCount} of ${tab.matchCount.toLocaleString()} matching`
+                      : tableInfo
+                        ? `${shownCount} of ${tableInfo.rowCount.toLocaleString()} rows`
+                        : `${shownCount} rows`
+
+                  return (
+                    <div
+                      key={tab.id}
+                      ref={(el) => {
+                        paneRefs.current[tab.id] = el
+                      }}
+                      className={`pane-card ${draggingTabId === tab.id ? 'pane-dragging' : ''}`}
+                      style={paneStyle}
+                    >
                       <div
-                        key={tab.id}
-                        ref={(el) => {
-                          paneRefs.current[tab.id] = el
-                        }}
-                        className={`pane-card ${draggingTabId === tab.id ? 'pane-dragging' : ''}`}
-                        style={{
-                          position: 'absolute',
-                          left: tab.x,
-                          top: tab.y,
-                          width: tab.width,
-                          height: tab.height,
-                          zIndex: tab.zIndex,
-                        }}
+                        className="pane-header pane-drag-handle"
+                        onPointerDown={(e) => handlePanePointerDown(e, tab.id)}
+                        title="Drag to move"
                       >
-                        <div
-                          className="pane-header pane-drag-handle"
-                          onPointerDown={(e) => handlePanePointerDown(e, tab.id)}
-                          title="Drag to move"
-                        >
-                        <span className="pane-drag-grip" aria-hidden>⋮⋮</span>
+                        <span className="pane-drag-grip" aria-hidden>
+                          ⋮⋮
+                        </span>
                         <h3 className="pane-title">
                           <span className="table-icon">📊</span>
                           {tab.tableName}
@@ -1260,28 +1852,25 @@ function App() {
                               ⋯
                             </button>
                             {openPaneMenuId === tab.id && (
-                              <div
-                                className="pane-menu-dropdown"
-                                onClick={(e) => e.stopPropagation()}
-                              >
+                              <div className="pane-menu-dropdown" onClick={(e) => e.stopPropagation()}>
                                 <button
                                   type="button"
                                   onClick={() => exportQueryResultsAsJson(tab.id)}
-                                  disabled={!getTabResultData(tab) || getTabResultData(tab)!.values.length === 0}
+                                  disabled={shownCount === 0}
                                 >
                                   Export as JSON
                                 </button>
                                 <button
                                   type="button"
                                   onClick={() => exportQueryResultsAsCsv(tab.id)}
-                                  disabled={!getTabResultData(tab) || getTabResultData(tab)!.values.length === 0}
+                                  disabled={shownCount === 0}
                                 >
                                   Export as CSV
                                 </button>
                                 <button
                                   type="button"
                                   onClick={() => copyQueryResultsAsJson(tab.id)}
-                                  disabled={!getTabResultData(tab) || getTabResultData(tab)!.values.length === 0}
+                                  disabled={shownCount === 0}
                                 >
                                   Copy as JSON (clipboard)
                                 </button>
@@ -1299,186 +1888,83 @@ function App() {
                         </div>
                       </div>
 
-                      {tableInfo && (
-                        <div className="table-schema pane-section">
-                          <button
-                            type="button"
-                            className="schema-toggle"
-                            onClick={() => toggleSchemaCollapsed(tab.id)}
-                            aria-expanded={!tab.schemaCollapsed}
-                          >
-                            <span className="schema-toggle-icon">
-                              {tab.schemaCollapsed ? '▶' : '▼'}
-                            </span>
-                            <h4>Schema (CREATE)</h4>
-                            <span className="schema-count">
-                              {tableInfo.createStatement ? 'SQL' : '—'}
-                            </span>
-                          </button>
-                          {!tab.schemaCollapsed && (
-                            <div className="schema-create-block">
-                              {tableInfo.createStatement ? (
-                                <pre className="create-statement">{tableInfo.createStatement}</pre>
-                              ) : (
-                                <p className="muted">No schema info</p>
-                              )}
-                            </div>
-                          )}
-                        </div>
-                      )}
-
-                      {tableInfo && (tableInfo.primaryKey.length > 0 || tableInfo.foreignKeys.length > 0) && (
-                        <div className="keys-relations pane-section">
-                          <button
-                            type="button"
-                            className="schema-toggle keys-toggle"
-                            onClick={() => toggleKeysCollapsed(tab.id)}
-                            aria-expanded={!tab.keysCollapsed}
-                          >
-                            <span className="schema-toggle-icon">
-                              {tab.keysCollapsed ? '▶' : '▼'}
-                            </span>
-                            <h4>Keys &amp; Relations</h4>
-                            <span className="schema-count">
-                              {tableInfo.primaryKey.length > 0 && `${tableInfo.primaryKey.length} PK`}
-                              {tableInfo.primaryKey.length > 0 && tableInfo.foreignKeys.length > 0 && ' · '}
-                              {tableInfo.foreignKeys.length > 0 && `${tableInfo.foreignKeys.length} FK`}
-                            </span>
-                          </button>
-                          {!tab.keysCollapsed && (
-                            <div className="keys-content">
-                              {tableInfo.primaryKey.length > 0 && (
-                                <div className="keys-block">
-                                  <span className="keys-label">Primary key</span>
-                                  <div className="keys-list">
-                                    {tableInfo.primaryKey.map((col, idx) => (
-                                      <span key={idx} className="key-badge key-pk">
-                                        {col}
-                                      </span>
-                                    ))}
-                                  </div>
-                                </div>
-                              )}
-                              {tableInfo.foreignKeys.length > 0 && (
-                                <div className="keys-block">
-                                  <span className="keys-label">Foreign keys</span>
-                                  <ul className="fk-list">
-                                    {tableInfo.foreignKeys.map((fk, idx) => (
-                                      <li key={idx} className="fk-item">
-                                        <span className="key-badge key-fk-from">{fk.from}</span>
-                                        <span className="fk-arrow">→</span>
-                                        <span className="key-badge key-fk-to">
-                                          {fk.toTable}({fk.toColumn})
-                                        </span>
-                                      </li>
-                                    ))}
-                                  </ul>
-                                </div>
-                              )}
-                            </div>
-                          )}
-                        </div>
-                      )}
-
-                      <div className="query-section pane-section">
-                        <h4>SQL Query</h4>
-                        <textarea
-                          className="query-editor"
-                          rows={4}
-                          value={tab.query}
-                          onChange={(e) => handleQueryChange(tab.id, e.target.value)}
-                          placeholder="SQL query..."
-                        />
-                        <div className="query-actions">
-                          <button
-                            type="button"
-                            onClick={() => handleExecuteQuery(tab.id)}
-                            className="execute-button"
-                          >
-                            ▶ Execute
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleSaveQuery(tab.id)}
-                            className="save-query-button"
-                          >
-                            Save query
-                          </button>
-                        </div>
+                      <div className="pane-tabs">
+                        <button
+                          type="button"
+                          className={`pane-tab ${tab.panel === 'filter' ? 'active' : ''}`}
+                          onClick={() => setPanePanel(tab.id, 'filter')}
+                        >
+                          🔎 Filter
+                        </button>
+                        <button
+                          type="button"
+                          className={`pane-tab ${tab.panel === 'sql' ? 'active' : ''}`}
+                          onClick={() => setPanePanel(tab.id, 'sql')}
+                        >
+                          {'</>'} SQL
+                        </button>
+                        <button
+                          type="button"
+                          className={`pane-tab ${tab.panel === 'schema' ? 'active' : ''}`}
+                          onClick={() => setPanePanel(tab.id, 'schema')}
+                          disabled={!tableInfo}
+                        >
+                          ⓘ Schema
+                        </button>
+                        <span className="pane-tabs-meta">{totalLabel}</span>
                       </div>
+
+                      {tab.panel === 'filter' && (
+                        <div className="pane-section">{renderFilterPanel(tab, tableInfo)}</div>
+                      )}
+
+                      {tab.panel === 'sql' && (
+                        <div className="query-section pane-section">
+                          <textarea
+                            className="query-editor"
+                            rows={4}
+                            value={tab.query}
+                            onChange={(e) => handleQueryChange(tab.id, e.target.value)}
+                            placeholder="SQL query..."
+                          />
+                          <div className="query-actions">
+                            <button
+                              type="button"
+                              onClick={() => handleExecuteQuery(tab.id)}
+                              className="execute-button"
+                            >
+                              ▶ Execute
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleSaveQuery(tab.id)}
+                              className="save-query-button"
+                            >
+                              Save query
+                            </button>
+                          </div>
+                          <p className="query-hint">
+                            REGEXP and EDITDIST(a, b) are available here too.
+                          </p>
+                        </div>
+                      )}
+
+                      {tab.panel === 'schema' && tableInfo && (
+                        <div className="pane-section">{renderSchemaPanel(tableInfo)}</div>
+                      )}
 
                       {tab.error && <div className="error-banner">{tab.error}</div>}
 
                       <div className="results-section pane-section">
-                        <h4>{tab.queryResult ? 'Query Results' : 'Table Data'}</h4>
-                        {tab.queryResult ? (
-                          <div className="table-wrapper">
-                            <table>
-                              <thead>
-                                <tr>
-                                  {tab.queryResult.columns.map((col: string) => (
-                                    <th key={col}>{col}</th>
-                                  ))}
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {tab.queryResult.values.length === 0 ? (
-                                  <tr>
-                                    <td colSpan={tab.queryResult.columns.length} className="empty-cell">
-                                      No rows returned
-                                    </td>
-                                  </tr>
-                                ) : (
-                                  tab.queryResult.values.map((row: unknown[], i: number) => (
-                                    <tr key={i}>
-                                      {row.map((cell: unknown, j: number) => (
-                                        <td key={j}>{cell != null ? String(cell) : <em>null</em>}</td>
-                                      ))}
-                                    </tr>
-                                  ))
-                                )}
-                              </tbody>
-                            </table>
-                          </div>
-                        ) : tab.tableData ? (
-                          <div className="table-wrapper">
-                            <table>
-                              <thead>
-                                <tr>
-                                  {tab.tableData.columns.map((col: string) => (
-                                    <th key={col}>{col}</th>
-                                  ))}
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {tab.tableData.values.length === 0 ? (
-                                  <tr>
-                                    <td colSpan={tab.tableData.columns.length} className="empty-cell">
-                                      No rows found
-                                    </td>
-                                  </tr>
-                                ) : (
-                                  tab.tableData.values.map((row: unknown[], i: number) => (
-                                    <tr key={i}>
-                                      {row.map((cell: unknown, j: number) => (
-                                        <td key={j}>{cell != null ? String(cell) : <em>null</em>}</td>
-                                      ))}
-                                    </tr>
-                                  ))
-                                )}
-                              </tbody>
-                            </table>
-                            {tab.tableData.values.length >= DEFAULT_ROW_LIMIT && (
-                              <p className="table-limit-note">First {DEFAULT_ROW_LIMIT} rows (descending). Use SQL for more.</p>
-                            )}
-                          </div>
+                        {shown ? (
+                          renderResultTable(shown)
                         ) : (
                           <p className="muted">No data</p>
                         )}
                       </div>
                     </div>
                   )
-                  })}
+                })}
               </div>
             </div>
           </div>

@@ -2,6 +2,8 @@
  * Main-thread bridge to dbWorker. Runs all DB operations off the main thread.
  */
 
+import type { FilterCondition, FilterOptions, GlobalSearchMode } from './filters'
+
 export type QueryExecResult = { columns: string[]; values: unknown[][] }
 
 export type TableInfo = {
@@ -12,9 +14,25 @@ export type TableInfo = {
   primaryKey: string[]
   foreignKeys: { from: string; toTable: string; toColumn: string }[]
   createStatement: string | null
+  hasRowid: boolean
 }
 
-export type AdvancedSearchMatch = { tableName: string; matchCount: number }
+export type DbInfo = {
+  sqliteVersion: string
+  pageSize: number
+  pageCount: number
+  sizeBytes: number
+  encoding: string
+  userVersion: number
+  applicationId: number
+  journalMode: string
+  tableCount: number
+  viewCount: number
+  indexCount: number
+  triggerCount: number
+}
+
+export type SearchMatch = { tableName: string; matchCount: number }
 
 type WorkerOut =
   | { type: 'opened'; id: number }
@@ -23,8 +41,9 @@ type WorkerOut =
   | { type: 'execError'; id: number; message: string }
   | { type: 'tableNames'; id: number; names: string[] }
   | { type: 'tableInfo'; id: number; info: TableInfo }
-  | { type: 'exported'; id: number; data: Uint8Array }
-  | { type: 'advancedSearchResult'; id: number; matches: AdvancedSearchMatch[] }
+  | { type: 'dbInfo'; id: number; info: DbInfo }
+  | { type: 'exported'; id: number; data: Uint8Array<ArrayBuffer> }
+  | { type: 'searchResult'; id: number; matches: SearchMatch[] }
 
 let worker: Worker | null = null
 let nextId = 1
@@ -56,7 +75,7 @@ function getWorker(): Worker {
       p.resolve(msg.names)
       return
     }
-    if (msg.type === 'tableInfo') {
+    if (msg.type === 'tableInfo' || msg.type === 'dbInfo') {
       p.resolve(msg.info)
       return
     }
@@ -64,7 +83,7 @@ function getWorker(): Worker {
       p.resolve(msg.data)
       return
     }
-    if (msg.type === 'advancedSearchResult') {
+    if (msg.type === 'searchResult') {
       p.resolve(msg.matches)
       return
     }
@@ -78,61 +97,65 @@ function getWorker(): Worker {
 
 const baseUrl = (import.meta.env.BASE_URL as string) || '/'
 
-export function openDb(bytes: Uint8Array): Promise<void> {
+/** Posts a message with a fresh id and resolves when the worker answers it. */
+function request<T>(payload: Record<string, unknown>, transfer?: Transferable[]): Promise<T> {
   const id = nextId++
-  return new Promise((resolve, reject) => {
+  return new Promise<T>((resolve, reject) => {
     pending.set(id, { resolve: resolve as (v: unknown) => void, reject })
-    getWorker().postMessage(
-      { type: 'open', baseUrl, bytes: bytes.buffer, id },
-      [bytes.buffer]
-    )
+    if (transfer) {
+      getWorker().postMessage({ ...payload, id }, transfer)
+    } else {
+      getWorker().postMessage({ ...payload, id })
+    }
   })
+}
+
+export function openDb(bytes: Uint8Array): Promise<void> {
+  return request<void>({ type: 'open', baseUrl, bytes: bytes.buffer }, [bytes.buffer])
 }
 
 export function execQuery(query: string): Promise<QueryExecResult | null> {
-  const id = nextId++
-  return new Promise((resolve, reject) => {
-    pending.set(id, { resolve: resolve as (v: unknown) => void, reject })
-    getWorker().postMessage({ type: 'exec', id, query })
-  })
+  return request<QueryExecResult | null>({ type: 'exec', query })
 }
 
 export function getTableNames(): Promise<string[]> {
-  const id = nextId++
-  return new Promise((resolve, reject) => {
-    pending.set(id, { resolve: resolve as (v: unknown) => void, reject })
-    getWorker().postMessage({ type: 'getTableNames', id })
-  })
+  return request<string[]>({ type: 'getTableNames' })
 }
 
 export function getTableInfo(name: string): Promise<TableInfo> {
-  const id = nextId++
-  return new Promise((resolve, reject) => {
-    pending.set(id, { resolve: resolve as (v: unknown) => void, reject })
-    getWorker().postMessage({ type: 'getTableInfo', id, name })
-  })
+  return request<TableInfo>({ type: 'getTableInfo', name })
 }
 
-export function exportDb(): Promise<Uint8Array> {
-  const id = nextId++
-  return new Promise((resolve, reject) => {
-    pending.set(id, { resolve: resolve as (v: unknown) => void, reject })
-    getWorker().postMessage({ type: 'export', id })
-  })
+export function getDbInfo(): Promise<DbInfo> {
+  return request<DbInfo>({ type: 'getDbInfo' })
 }
 
-export function advancedSearchRaw(value: string): Promise<AdvancedSearchMatch[]> {
-  const id = nextId++
-  return new Promise((resolve, reject) => {
-    pending.set(id, { resolve: resolve as (v: unknown) => void, reject })
-    getWorker().postMessage({ type: 'advancedSearchRaw', id, value })
-  })
+export function exportDb(): Promise<Uint8Array<ArrayBuffer>> {
+  return request<Uint8Array<ArrayBuffer>>({ type: 'export' })
 }
 
-export function advancedSearchJson(criteria: Record<string, unknown>): Promise<AdvancedSearchMatch[]> {
-  const id = nextId++
-  return new Promise((resolve, reject) => {
-    pending.set(id, { resolve: resolve as (v: unknown) => void, reject })
-    getWorker().postMessage({ type: 'advancedSearchJson', id, criteria })
-  })
+/** Finds every table holding `value`, using the given match mode. */
+export function searchAllTables(
+  value: string,
+  mode: GlobalSearchMode,
+  options: FilterOptions,
+  columnFilter?: string
+): Promise<SearchMatch[]> {
+  return request<SearchMatch[]>({ type: 'searchAll', value, mode, options, columnFilter })
+}
+
+/** Finds tables where every key in the JSON object matches a column value. */
+export function searchJsonCriteria(
+  criteria: Record<string, unknown>
+): Promise<SearchMatch[]> {
+  return request<SearchMatch[]>({ type: 'searchJson', criteria })
+}
+
+/** Finds tables that carry all referenced columns and match the conditions. */
+export function searchConditions(
+  conditions: FilterCondition[],
+  join: 'AND' | 'OR',
+  options: FilterOptions
+): Promise<SearchMatch[]> {
+  return request<SearchMatch[]>({ type: 'searchConditions', conditions, join, options })
 }

@@ -3,6 +3,16 @@
  */
 
 import initSqlJs from 'sql.js'
+import {
+  buildCount,
+  buildGlobalWhere,
+  buildJsonCriteriaWhere,
+  buildWhereClause,
+  quoteIdent,
+  type FilterCondition,
+  type FilterOptions,
+  type GlobalSearchMode,
+} from './filters'
 
 type ForeignKeyInfo = { from: string; toTable: string; toColumn: string }
 type TableInfo = {
@@ -13,18 +23,49 @@ type TableInfo = {
   primaryKey: string[]
   foreignKeys: ForeignKeyInfo[]
   createStatement: string | null
+  hasRowid: boolean
 }
 
-type AdvancedSearchMatch = { tableName: string; matchCount: number }
+type DbInfo = {
+  sqliteVersion: string
+  pageSize: number
+  pageCount: number
+  sizeBytes: number
+  encoding: string
+  userVersion: number
+  applicationId: number
+  journalMode: string
+  tableCount: number
+  viewCount: number
+  indexCount: number
+  triggerCount: number
+}
+
+type SearchMatch = { tableName: string; matchCount: number }
 
 type InMessage =
   | { type: 'open'; baseUrl: string; bytes: ArrayBuffer; id: number }
   | { type: 'exec'; id: number; query: string }
   | { type: 'getTableNames'; id: number }
   | { type: 'getTableInfo'; id: number; name: string }
+  | { type: 'getDbInfo'; id: number }
   | { type: 'export'; id: number }
-  | { type: 'advancedSearchRaw'; id: number; value: string }
-  | { type: 'advancedSearchJson'; id: number; criteria: Record<string, unknown> }
+  | {
+      type: 'searchAll'
+      id: number
+      value: string
+      mode: GlobalSearchMode
+      options: FilterOptions
+      columnFilter?: string
+    }
+  | { type: 'searchJson'; id: number; criteria: Record<string, unknown> }
+  | {
+      type: 'searchConditions'
+      id: number
+      conditions: FilterCondition[]
+      join: 'AND' | 'OR'
+      options: FilterOptions
+    }
 
 let SQL: Awaited<ReturnType<typeof initSqlJs>> | null = null
 let db: import('sql.js').Database | null = null
@@ -36,9 +77,94 @@ async function ensureSql(baseUrl: string) {
   })
 }
 
+/* ---------------------------------------------------------------- *
+ * Custom SQL functions backing the regex and fuzzy filter operators.
+ * ---------------------------------------------------------------- */
+
+const MAX_EDIT_LEN = 512
+const regexCache = new Map<string, RegExp | null>()
+
+function compileRegex(pattern: string): RegExp | null {
+  if (regexCache.has(pattern)) return regexCache.get(pattern) ?? null
+  let source = pattern
+  let flags = ''
+  // Inline (?i) isn't valid in JS, so translate the common case to a flag.
+  const inline = /^\(\?([imsu]+)\)/.exec(source)
+  if (inline) {
+    flags = inline[1]
+    source = source.slice(inline[0].length)
+  }
+  let compiled: RegExp | null = null
+  try {
+    compiled = new RegExp(source, flags)
+  } catch {
+    compiled = null
+  }
+  if (regexCache.size > 200) regexCache.clear()
+  regexCache.set(pattern, compiled)
+  return compiled
+}
+
+/** Levenshtein distance, two-row variant. */
+function editDistance(a: string, b: string): number {
+  if (a === b) return 0
+  if (a.length === 0) return b.length
+  if (b.length === 0) return a.length
+  if (a.length > MAX_EDIT_LEN) a = a.slice(0, MAX_EDIT_LEN)
+  if (b.length > MAX_EDIT_LEN) b = b.slice(0, MAX_EDIT_LEN)
+
+  let prev = new Array<number>(b.length + 1)
+  let curr = new Array<number>(b.length + 1)
+  for (let j = 0; j <= b.length; j++) prev[j] = j
+
+  for (let i = 1; i <= a.length; i++) {
+    curr[0] = i
+    const ca = a.charCodeAt(i - 1)
+    for (let j = 1; j <= b.length; j++) {
+      const cost = ca === b.charCodeAt(j - 1) ? 0 : 1
+      curr[j] = Math.min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost)
+    }
+    const swap = prev
+    prev = curr
+    curr = swap
+  }
+  return prev[b.length]
+}
+
+function registerFunctions(database: import('sql.js').Database) {
+  // SQLite rewrites `X REGEXP Y` as regexp(Y, X) — pattern first.
+  database.create_function('REGEXP', (pattern: unknown, value: unknown) => {
+    if (value === null || value === undefined || pattern === null) return 0
+    const re = compileRegex(String(pattern))
+    if (!re) return 0
+    re.lastIndex = 0
+    return re.test(String(value)) ? 1 : 0
+  })
+
+  database.create_function('EDITDIST', (a: unknown, b: unknown) => {
+    if (a === null || a === undefined || b === null || b === undefined) {
+      return MAX_EDIT_LEN + 1
+    }
+    return editDistance(String(a), String(b))
+  })
+}
+
+/* ---------------------------------------------------------------- */
+
+function scalar(sql: string): unknown {
+  if (!db) return null
+  try {
+    const res = db.exec(sql)
+    if (res[0] && res[0].values.length > 0) return res[0].values[0][0]
+  } catch {
+    /* pragma unsupported */
+  }
+  return null
+}
+
 function getTableInfo(name: string): TableInfo {
   if (!db) throw new Error('Database not open')
-  const quoted = `"${name.replace(/"/g, '""')}"`
+  const quoted = quoteIdent(name)
   const schemaRes = db.exec(`PRAGMA table_info(${quoted});`)
   const columns: string[] = []
   const columnDetails: { name: string; type: string; pk: number }[] = []
@@ -97,7 +223,7 @@ function getTableInfo(name: string): TableInfo {
   let createStatement: string | null = null
   try {
     const sqlRes = db.exec(
-      `SELECT sql FROM sqlite_master WHERE type='table' AND name=${quoted};`
+      `SELECT sql FROM sqlite_master WHERE type='table' AND name=${sqlName(name)};`
     )
     if (sqlRes[0] && sqlRes[0].values.length > 0) {
       const sqlIdx = sqlRes[0].columns.indexOf('sql')
@@ -109,6 +235,9 @@ function getTableInfo(name: string): TableInfo {
     /* ignore */
   }
 
+  // WITHOUT ROWID tables reject `ORDER BY rowid`, so callers need to know.
+  const hasRowid = !(createStatement && /WITHOUT\s+ROWID/i.test(createStatement))
+
   return {
     name,
     columns,
@@ -117,93 +246,86 @@ function getTableInfo(name: string): TableInfo {
     primaryKey,
     foreignKeys,
     createStatement,
+    hasRowid,
   }
 }
 
-function escapeLikePattern(value: string): string {
-  return value.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_')
+function sqlName(value: string): string {
+  return "'" + value.replace(/'/g, "''") + "'"
 }
 
-function quoteIdentifier(name: string): string {
-  return `"${name.replace(/"/g, '""')}"`
-}
-
-function sqlLiteral(v: unknown): string {
-  if (v === null || v === undefined) return 'NULL'
-  if (typeof v === 'number') return String(v)
-  if (typeof v === 'boolean') return v ? '1' : '0'
-  return "'" + String(v).replace(/'/g, "''") + "'"
-}
-
-function advancedSearchRaw(value: string): AdvancedSearchMatch[] {
-  if (!db) return []
-  const escaped = escapeLikePattern(value)
-  const pattern = `%${escaped}%`
-  const namesRes = db.exec("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;")
-  const tableNames: string[] = []
-  if (namesRes[0]) {
-    const idx = namesRes[0].columns.indexOf('name')
-    if (idx !== -1) {
-      namesRes[0].values.forEach((row: unknown[]) => tableNames.push(String(row[idx])))
+function getDbInfo(): DbInfo {
+  const pageSize = Number(scalar('PRAGMA page_size;')) || 0
+  const pageCount = Number(scalar('PRAGMA page_count;')) || 0
+  const counts: Record<string, number> = {}
+  if (db) {
+    try {
+      const res = db.exec(
+        "SELECT type, COUNT(*) AS c FROM sqlite_master GROUP BY type;"
+      )
+      if (res[0]) {
+        res[0].values.forEach((row: unknown[]) => {
+          counts[String(row[0])] = Number(row[1]) || 0
+        })
+      }
+    } catch {
+      /* ignore */
     }
   }
-  const matches: AdvancedSearchMatch[] = []
-  for (const tableName of tableNames) {
+  return {
+    sqliteVersion: String(scalar('SELECT sqlite_version();') ?? '—'),
+    pageSize,
+    pageCount,
+    sizeBytes: pageSize * pageCount,
+    encoding: String(scalar('PRAGMA encoding;') ?? '—'),
+    userVersion: Number(scalar('PRAGMA user_version;')) || 0,
+    applicationId: Number(scalar('PRAGMA application_id;')) || 0,
+    journalMode: String(scalar('PRAGMA journal_mode;') ?? '—'),
+    tableCount: counts.table ?? 0,
+    viewCount: counts.view ?? 0,
+    indexCount: counts.index ?? 0,
+    triggerCount: counts.trigger ?? 0,
+  }
+}
+
+function listTableNames(): string[] {
+  if (!db) return []
+  const res = db.exec(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name;"
+  )
+  const names: string[] = []
+  if (res[0]) {
+    const idx = res[0].columns.indexOf('name')
+    if (idx !== -1) res[0].values.forEach((row: unknown[]) => names.push(String(row[idx])))
+  }
+  return names
+}
+
+function countMatches(tableName: string, where: string | null): number {
+  if (!db || !where) return 0
+  const res = db.exec(buildCount(tableName, where))
+  if (res[0] && res[0].values.length > 0) return Number(res[0].values[0][0]) || 0
+  return 0
+}
+
+/** Runs one WHERE-builder across every table, keeping the ones that match. */
+function searchTables(
+  makeWhere: (info: TableInfo) => string | null
+): SearchMatch[] {
+  const matches: SearchMatch[] = []
+  for (const tableName of listTableNames()) {
     try {
       const info = getTableInfo(tableName)
       if (info.columns.length === 0) continue
-      const quoted = quoteIdentifier(tableName)
-      const conditions = info.columns
-        .map((col) => `CAST(${quoteIdentifier(col)} AS TEXT) LIKE '${pattern.replace(/'/g, "''")}' ESCAPE '\\'`)
-        .join(' OR ')
-      const res = db.exec(`SELECT COUNT(*) AS c FROM ${quoted} WHERE (${conditions});`)
-      if (res[0] && res[0].values.length > 0) {
-        const count = Number(res[0].values[0][0]) || 0
-        if (count > 0) matches.push({ tableName, matchCount: count })
-      }
+      const where = makeWhere(info)
+      if (!where) continue
+      const matchCount = countMatches(tableName, where)
+      if (matchCount > 0) matches.push({ tableName, matchCount })
     } catch {
-      /* skip table */
+      /* skip tables the filter can't apply to */
     }
   }
-  return matches
-}
-
-function advancedSearchJson(criteria: Record<string, unknown>): AdvancedSearchMatch[] {
-  if (!db) return []
-  const keys = Object.keys(criteria)
-  if (keys.length === 0) return []
-  const namesRes = db.exec("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;")
-  const tableNames: string[] = []
-  if (namesRes[0]) {
-    const idx = namesRes[0].columns.indexOf('name')
-    if (idx !== -1) {
-      namesRes[0].values.forEach((row: unknown[]) => tableNames.push(String(row[idx])))
-    }
-  }
-  const matches: AdvancedSearchMatch[] = []
-  for (const tableName of tableNames) {
-    try {
-      const info = getTableInfo(tableName)
-      const tableCols = new Set(info.columns.map((c) => c.toLowerCase()))
-      const hasAll = keys.every((k) => tableCols.has(k.toLowerCase()))
-      if (!hasAll) continue
-      const quoted = quoteIdentifier(tableName)
-      const conditions = keys
-        .map((k) => {
-          const col = info.columns.find((c) => c.toLowerCase() === k.toLowerCase())!
-          return `${quoteIdentifier(col)} = ${sqlLiteral(criteria[k])}`
-        })
-        .join(' AND ')
-      const res = db.exec(`SELECT COUNT(*) AS c FROM ${quoted} WHERE (${conditions});`)
-      if (res[0] && res[0].values.length > 0) {
-        const count = Number(res[0].values[0][0]) || 0
-        if (count > 0) matches.push({ tableName, matchCount: count })
-      }
-    } catch {
-      /* skip table */
-    }
-  }
-  return matches
+  return matches.sort((a, b) => b.matchCount - a.matchCount)
 }
 
 self.onmessage = async (e: MessageEvent<InMessage>) => {
@@ -216,6 +338,8 @@ self.onmessage = async (e: MessageEvent<InMessage>) => {
         db = null
       }
       db = new SQL!.Database(new Uint8Array(msg.bytes))
+      registerFunctions(db)
+      regexCache.clear()
       self.postMessage({ type: 'opened', id: msg.id })
       return
     }
@@ -242,15 +366,7 @@ self.onmessage = async (e: MessageEvent<InMessage>) => {
     }
 
     if (msg.type === 'getTableNames') {
-      const res = db.exec("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;")
-      const names: string[] = []
-      if (res[0]) {
-        const idx = res[0].columns.indexOf('name')
-        if (idx !== -1) {
-          res[0].values.forEach((row: unknown[]) => names.push(String(row[idx])))
-        }
-      }
-      self.postMessage({ type: 'tableNames', id: msg.id, names })
+      self.postMessage({ type: 'tableNames', id: msg.id, names: listTableNames() })
       return
     }
 
@@ -260,21 +376,49 @@ self.onmessage = async (e: MessageEvent<InMessage>) => {
       return
     }
 
+    if (msg.type === 'getDbInfo') {
+      self.postMessage({ type: 'dbInfo', id: msg.id, info: getDbInfo() })
+      return
+    }
+
     if (msg.type === 'export') {
       const data = db.export()
       self.postMessage({ type: 'exported', id: msg.id, data }, { transfer: [data.buffer] })
       return
     }
 
-    if (msg.type === 'advancedSearchRaw') {
-      const matches = advancedSearchRaw(msg.value)
-      self.postMessage({ type: 'advancedSearchResult', id: msg.id, matches })
+    if (msg.type === 'searchAll') {
+      const needle = msg.columnFilter?.trim().toLowerCase()
+      const matches = searchTables((info) => {
+        const columns = needle
+          ? info.columns.filter((c) => c.toLowerCase().includes(needle))
+          : info.columns
+        return buildGlobalWhere(columns, msg.value, msg.mode, msg.options)
+      })
+      self.postMessage({ type: 'searchResult', id: msg.id, matches })
       return
     }
 
-    if (msg.type === 'advancedSearchJson') {
-      const matches = advancedSearchJson(msg.criteria)
-      self.postMessage({ type: 'advancedSearchResult', id: msg.id, matches })
+    if (msg.type === 'searchJson') {
+      const matches = searchTables((info) =>
+        buildJsonCriteriaWhere(info.columns, msg.criteria)
+      )
+      self.postMessage({ type: 'searchResult', id: msg.id, matches })
+      return
+    }
+
+    if (msg.type === 'searchConditions') {
+      const matches = searchTables((info) => {
+        const lower = new Set(info.columns.map((c) => c.toLowerCase()))
+        // Only tables that actually have every referenced column.
+        if (!msg.conditions.every((c) => lower.has(c.column.toLowerCase()))) return null
+        const resolved = msg.conditions.map((c) => ({
+          ...c,
+          column: info.columns.find((col) => col.toLowerCase() === c.column.toLowerCase())!,
+        }))
+        return buildWhereClause(resolved, msg.join, msg.options)
+      })
+      self.postMessage({ type: 'searchResult', id: msg.id, matches })
       return
     }
   } catch (err) {

@@ -8,6 +8,7 @@ declare module 'sql.js' {
       exec(sql: string): QueryExecResult[]
       export(): Uint8Array
       close(): void
+      create_function(name: string, fn: (...args: never[]) => unknown): void
     }
   }>
   export type { Database, QueryExecResult }
