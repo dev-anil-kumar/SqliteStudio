@@ -35,6 +35,7 @@ import {
   formatBytes,
   resolveDb,
 } from './dbSource'
+import GraphView from './GraphView'
 import './App.css'
 
 type SqlResult = QueryExecResult | null
@@ -220,6 +221,10 @@ function App() {
       return 'dark'
     }
   })
+  // The graph lives at its own address, so it survives a reload and the
+  // browser's back button behaves the way people expect it to.
+  const [hashRoute, setHashRoute] = useState(() => window.location.hash)
+
   const fileInputRef = useRef<HTMLInputElement>(null)
   const paneRefs = useRef<Record<string, HTMLDivElement | null>>({})
   const canvasRef = useRef<HTMLDivElement>(null)
@@ -243,6 +248,16 @@ function App() {
       getRecentList().then(setRecentList).catch(() => setRecentList([]))
     }
   }, [loadState])
+
+  useEffect(() => {
+    const sync = () => setHashRoute(window.location.hash)
+    window.addEventListener('hashchange', sync)
+    window.addEventListener('popstate', sync)
+    return () => {
+      window.removeEventListener('hashchange', sync)
+      window.removeEventListener('popstate', sync)
+    }
+  }, [])
 
   useEffect(() => {
     const entries = Object.entries(paneRefs.current)
@@ -316,6 +331,8 @@ function App() {
     const q = recentSearch.trim().toLowerCase()
     return recentList.filter((e) => e.filename.toLowerCase().includes(q))
   }, [recentList, recentSearch])
+
+  const graphOpen = hashRoute.startsWith('#/graph')
 
   const totalRows = useMemo(
     () => tableInfos.reduce((sum, info) => sum + info.rowCount, 0),
@@ -976,7 +993,25 @@ function App() {
     }
   }
 
+  const baseHref = () => window.location.pathname + window.location.search
+
+  function openGraph() {
+    window.history.pushState(null, '', baseHref() + '#/graph')
+    setHashRoute('#/graph')
+  }
+
+  function closeGraph() {
+    window.history.replaceState(null, '', baseHref())
+    setHashRoute('')
+  }
+
+  function openTableFromGraph(name: string) {
+    closeGraph()
+    handleTableSelect(name)
+  }
+
   function closeDatabase() {
+    closeGraph()
     setLoadState('idle')
     setTabs([])
     setTabOrder([])
@@ -1459,7 +1494,17 @@ function App() {
         </section>
       )}
 
-      {loadState === 'ready' && (
+      {loadState === 'ready' && graphOpen && (
+        <GraphView
+          key={source?.filename ?? 'db'}
+          tables={tableInfos}
+          onBack={closeGraph}
+          onOpenTable={openTableFromGraph}
+          title={source?.filename}
+        />
+      )}
+
+      {loadState === 'ready' && !graphOpen && (
         <main className="app-main-with-sidebar">
           <aside className="tables-sidebar">
             <div className="db-summary">
@@ -1471,6 +1516,9 @@ function App() {
                 {dbInfo ? ` · ${formatBytes(dbInfo.sizeBytes)}` : ''}
               </div>
               <div className="db-summary-actions">
+                <button type="button" className="db-summary-graph" onClick={openGraph}>
+                  Schema graph
+                </button>
                 <button type="button" onClick={openDbInfoPane}>
                   Details
                 </button>
@@ -1703,6 +1751,9 @@ function App() {
                     Click a table on the left to open it in a pane, or search a value across every
                     table to find where it lives.
                   </p>
+                  <button type="button" className="empty-graph-button" onClick={openGraph}>
+                    See the schema as a graph →
+                  </button>
                 </div>
               )}
               <div
@@ -1971,7 +2022,7 @@ function App() {
         </main>
       )}
 
-      <footer className="app-footer">
+      <footer className="app-footer" hidden={graphOpen}>
         <p className="muted">
           All work happens in your browser. No data is uploaded to any server. Designed to be
           deployed as a static app (GitHub Pages compatible).

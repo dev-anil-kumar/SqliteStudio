@@ -1952,3 +1952,36 @@ tbody tr:hover {
   font-size: 0.72rem;
   opacity: 0.85;
 }
+
+/* The schema graph is the sidebar's headline action, so it reads as one. */
+.db-summary-actions .db-summary-graph {
+  flex: 1.6;
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border-subtle));
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.db-summary-actions .db-summary-graph:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+
+.empty-graph-button {
+  margin-top: 1rem;
+  padding: 0.45rem 0.95rem;
+  font-size: 0.82rem;
+  border-radius: 0.45rem;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.empty-graph-button:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}

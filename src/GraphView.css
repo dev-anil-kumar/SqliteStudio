@@ -1,0 +1,663 @@
+/* ---------------------------------------------------------------
+   Schema graph: toolbar, canvas, boxes and links.
+
+   Colours come from the app's theme variables so the map follows the
+   light/dark toggle without a second palette.
+   --------------------------------------------------------------- */
+
+.sg-root {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  height: calc(100vh - 150px);
+  border: 1px solid var(--border-subtle);
+  border-radius: 0.75rem;
+  overflow: hidden;
+  background: var(--bg-base);
+
+  --sg-link: color-mix(in srgb, var(--text-secondary) 62%, transparent);
+  --sg-pk: #f0b429;
+  --sg-fk: #4f9cf9;
+}
+
+/* ---------- Toolbar ---------- */
+
+.sg-toolbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  padding: 0.5rem 0.7rem;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-elevated);
+}
+
+.sg-back {
+  flex: none;
+  padding: 0.32rem 0.7rem;
+  font-size: 0.78rem;
+  font-weight: 500;
+  border-radius: 0.4rem;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-base);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.sg-back:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent);
+}
+
+.sg-title {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+  min-width: 0;
+}
+
+.sg-title strong {
+  font-size: 0.85rem;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sg-meta {
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.sg-search {
+  flex: 1 1 12rem;
+  min-width: 8rem;
+  max-width: 20rem;
+  padding: 0.35rem 0.55rem;
+  font-size: 0.78rem;
+  font-family: inherit;
+  border-radius: 0.4rem;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-base);
+  color: var(--text-primary);
+}
+
+.sg-search:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.sg-segment {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 0.45rem;
+  background: var(--bg-base);
+}
+
+.sg-segment button {
+  padding: 0.22rem 0.5rem;
+  font-size: 0.72rem;
+  border: 0;
+  border-radius: 0.3rem;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.sg-segment button:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+.sg-segment button.active {
+  background: var(--accent);
+  color: var(--accent-fg);
+}
+
+.sg-zoom {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  padding: 2px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 0.45rem;
+  background: var(--bg-base);
+}
+
+.sg-zoom button {
+  width: 1.4rem;
+  height: 1.4rem;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.85rem;
+  line-height: 1;
+  border: 0;
+  border-radius: 0.28rem;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.sg-zoom button:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.sg-zoom-label {
+  min-width: 2.9rem;
+  text-align: center;
+  font-size: 0.7rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+
+.sg-btn {
+  padding: 0.3rem 0.6rem;
+  font-size: 0.75rem;
+  border-radius: 0.4rem;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-base);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.sg-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+/* ---------- Options popover ---------- */
+
+.sg-options-wrap {
+  position: relative;
+}
+
+.sg-options {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 20;
+  width: 16rem;
+  padding: 0.6rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: 0.5rem;
+  background: var(--bg-elevated);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
+}
+
+.sg-opt {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.76rem;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.sg-opt input {
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.sg-opt-hint {
+  margin: -0.2rem 0 0.1rem 1.35rem;
+  font-size: 0.68rem;
+  line-height: 1.4;
+  color: var(--text-secondary);
+}
+
+.sg-opt-action {
+  margin-top: 0.15rem;
+  padding: 0.32rem 0.5rem;
+  font-size: 0.75rem;
+  border-radius: 0.35rem;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-base);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.sg-opt-action:hover {
+  background: var(--bg-hover);
+}
+
+/* ---------- Selection bar ---------- */
+
+.sg-selection {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.35rem 0.7rem;
+  border-bottom: 1px solid var(--border-subtle);
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-elevated));
+}
+
+.sg-selection-name {
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.sg-selection-meta {
+  flex: 1;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+}
+
+.sg-selection button {
+  padding: 0.25rem 0.55rem;
+  font-size: 0.73rem;
+  border-radius: 0.35rem;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-base);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.sg-selection button:hover {
+  border-color: var(--accent);
+  background: var(--bg-hover);
+}
+
+/* ---------- Canvas ---------- */
+
+.sg-host {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  touch-action: none;
+  cursor: grab;
+  background: var(--bg-base);
+}
+
+.sg-host.panning {
+  cursor: grabbing;
+}
+
+.sg-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.sg-ground {
+  pointer-events: none;
+}
+
+.sg-dot-mark {
+  fill: var(--border-subtle);
+  opacity: 0.55;
+}
+
+/* ---------- Links ---------- */
+
+.sg-edge {
+  fill: none;
+  stroke: var(--sg-link);
+  stroke-width: 1.6;
+  transition: opacity 0.18s ease, stroke 0.18s ease;
+}
+
+.sg-edge.guessed {
+  stroke-dasharray: 5 4;
+  opacity: 0.75;
+}
+
+.sg-edge.lit {
+  stroke: var(--accent);
+  stroke-width: 2.4;
+  opacity: 1;
+}
+
+.sg-edge.dim {
+  opacity: 0.12;
+}
+
+.sg-arrow-head {
+  fill: var(--sg-link);
+}
+
+.sg-arrow-head.lit {
+  fill: var(--accent);
+}
+
+/* ---------- Table boxes ---------- */
+
+.sg-node {
+  cursor: grab;
+}
+
+.sg-svg.dragging .sg-node {
+  cursor: grabbing;
+}
+
+.sg-node:focus {
+  outline: none;
+}
+
+.sg-box {
+  fill: var(--bg-elevated);
+  stroke: var(--border-subtle);
+  stroke-width: 1.2;
+}
+
+.sg-cap {
+  fill: color-mix(in srgb, var(--text-secondary) 9%, var(--bg-elevated));
+  pointer-events: none;
+}
+
+.sg-rule {
+  stroke: var(--border-subtle);
+  stroke-width: 1;
+}
+
+.sg-node:hover .sg-box {
+  stroke: var(--text-secondary);
+}
+
+.sg-node.sel .sg-box,
+.sg-node:focus-visible .sg-box {
+  stroke: var(--accent);
+  stroke-width: 2.2;
+}
+
+.sg-node.hit .sg-box {
+  stroke: var(--sg-pk);
+  stroke-width: 2;
+}
+
+.sg-node.lone .sg-box {
+  stroke-dasharray: 4 3;
+}
+
+.sg-node.dim {
+  opacity: 0.22;
+}
+
+.sg-node {
+  transition: opacity 0.18s ease;
+}
+
+.sg-name,
+.sg-sub,
+.sg-col,
+.sg-type,
+.sg-more,
+.sg-twist text {
+  pointer-events: none;
+  user-select: none;
+}
+
+.sg-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  fill: var(--text-primary);
+  font-family: system-ui, sans-serif;
+}
+
+.sg-sub {
+  font-size: 9.5px;
+  fill: var(--text-secondary);
+  font-family: system-ui, sans-serif;
+}
+
+.sg-col,
+.sg-type,
+.sg-more {
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.sg-col {
+  fill: var(--text-primary);
+}
+
+.sg-type {
+  fill: var(--text-secondary);
+  opacity: 0.85;
+}
+
+.sg-more {
+  fill: var(--text-secondary);
+  font-style: italic;
+  opacity: 0.8;
+}
+
+.sg-bullet {
+  fill: var(--border-subtle);
+}
+
+.sg-row.pk .sg-bullet {
+  fill: var(--sg-pk);
+}
+
+.sg-row.fk .sg-bullet {
+  fill: var(--sg-fk);
+}
+
+.sg-row.pk .sg-col {
+  font-weight: 600;
+}
+
+.sg-row.fk .sg-type {
+  fill: var(--sg-fk);
+  opacity: 0.95;
+}
+
+.sg-row.guessed .sg-bullet {
+  fill: none;
+  stroke: var(--sg-fk);
+  stroke-width: 1.4;
+}
+
+.sg-row.guessed .sg-type {
+  opacity: 0.7;
+}
+
+/* ---------- Expand control ---------- */
+
+.sg-twist {
+  cursor: pointer;
+}
+
+.sg-twist circle {
+  fill: var(--bg-base);
+  stroke: var(--border-subtle);
+  stroke-width: 1;
+}
+
+.sg-twist text {
+  font-size: 12px;
+  fill: var(--text-secondary);
+  font-family: system-ui, sans-serif;
+}
+
+.sg-node:hover .sg-twist circle {
+  stroke: var(--accent);
+  fill: color-mix(in srgb, var(--accent) 15%, var(--bg-base));
+}
+
+/* ---------- Overlays ---------- */
+
+.sg-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  pointer-events: none;
+}
+
+.sg-empty-box {
+  max-width: 26rem;
+  text-align: center;
+  pointer-events: auto;
+}
+
+.sg-empty-box h2 {
+  margin: 0 0 0.4rem;
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+
+.sg-empty-box p {
+  margin: 0 0 0.8rem;
+  font-size: 0.85rem;
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+.sg-empty-box button {
+  padding: 0.4rem 0.9rem;
+  font-size: 0.8rem;
+  border-radius: 0.4rem;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: var(--accent-fg);
+  cursor: pointer;
+}
+
+.sg-legend {
+  position: absolute;
+  left: 0.75rem;
+  bottom: 0.75rem;
+  max-width: 20rem;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: 0.5rem;
+  background: color-mix(in srgb, var(--bg-elevated) 92%, transparent);
+  backdrop-filter: blur(6px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
+}
+
+.sg-legend-close {
+  position: absolute;
+  top: 0.25rem;
+  right: 0.3rem;
+  width: 1.1rem;
+  height: 1.1rem;
+  padding: 0;
+  font-size: 0.65rem;
+  line-height: 1;
+  border: 0;
+  border-radius: 0.25rem;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.sg-legend-close:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.sg-legend ul {
+  list-style: none;
+  margin: 0 0 0.45rem;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.9rem;
+}
+
+.sg-legend li {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+}
+
+.sg-key {
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  flex: none;
+}
+
+.sg-key.pk {
+  background: var(--sg-pk);
+}
+
+.sg-key.fk {
+  background: var(--sg-fk);
+}
+
+.sg-key.line {
+  width: 1.1rem;
+  height: 0;
+  border-radius: 0;
+  border-top: 2px solid var(--sg-link);
+}
+
+.sg-key.line.guessed {
+  border-top-style: dashed;
+}
+
+.sg-legend p {
+  margin: 0;
+  font-size: 0.67rem;
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+
+.sg-legend kbd {
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 0.62rem;
+  padding: 0.05rem 0.25rem;
+  margin: 0 0.15rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: 0.2rem;
+  background: var(--bg-base);
+}
+
+.sg-help {
+  position: absolute;
+  left: 0.75rem;
+  bottom: 0.75rem;
+  width: 1.7rem;
+  height: 1.7rem;
+  padding: 0;
+  font-size: 0.8rem;
+  border-radius: 50%;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  cursor: pointer;
+  opacity: 0.75;
+  transition: opacity 0.15s, color 0.15s;
+}
+
+.sg-help:hover {
+  opacity: 1;
+  color: var(--text-primary);
+  border-color: var(--accent);
+}
+
+@media (max-width: 880px) {
+  .sg-title,
+  .sg-zoom-label {
+    display: none;
+  }
+  .sg-toolbar {
+    gap: 0.35rem;
+    padding: 0.45rem 0.5rem;
+  }
+}
