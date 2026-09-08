@@ -17,8 +17,11 @@ import {
   ROW_H,
   clamp,
   countDeclaredLinks,
+  edgeHighlight,
   edgePath,
   layoutSchema,
+  nodeHighlight,
+  relatednessFrom,
   withInferredLinks,
   type Bounds,
   type Density,
@@ -80,6 +83,13 @@ function hasResolvableLink(tables: GraphTable[]): boolean {
   return tables.some((t) => t.foreignKeys.some((fk) => names.has(fk.toTable.toLowerCase())))
 }
 
+const DEPTHS: { value: number; label: string; hint: string }[] = [
+  { value: 1, label: '1', hint: 'Direct relations only' },
+  { value: 2, label: '2', hint: 'Direct relations and one step beyond' },
+  { value: 3, label: '3', hint: 'Up to three hops away' },
+  { value: Infinity, label: 'All', hint: 'Everything reachable through foreign keys' },
+]
+
 const DENSITIES: { value: Density; label: string; hint: string }[] = [
   { value: 'compact', label: 'Compact', hint: 'Table names only' },
   { value: 'keys', label: 'Keys', hint: 'Primary and foreign key columns' },
@@ -95,6 +105,7 @@ export default function GraphView({ tables, onBack, onOpenTable, title }: Props)
     return countDeclaredLinks(base) === 0 && base.length > 1
   })
   const [selected, setSelected] = useState<string | null>(null)
+  const [depth, setDepth] = useState(2)
   const [query, setQuery] = useState('')
   const [offsets, setOffsets] = useState<Record<string, Offset>>({})
   const [optionsOpen, setOptionsOpen] = useState(false)
@@ -446,15 +457,12 @@ export default function GraphView({ tables, onBack, onOpenTable, title }: Props)
     return hit
   }, [query, graphTables])
 
-  const related = useMemo(() => {
-    if (!selected) return null
-    const set = new Set<string>([selected])
-    ;(incident.get(selected) ?? []).forEach((e) => {
-      set.add(e.from)
-      set.add(e.to)
-    })
-    return set
-  }, [selected, incident])
+  // How far every other table sits from the selected one, so direct and
+  // indirect relations can be told apart instead of collapsed into "related".
+  const relation = useMemo(
+    () => (selected ? relatednessFrom(layout.edges, selected, depth) : null),
+    [selected, layout.edges, depth]
+  )
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -509,6 +517,8 @@ export default function GraphView({ tables, onBack, onOpenTable, title }: Props)
   }
 
   /* ---------- render ---------- */
+
+  const highlight = { selected, relation, matches }
 
   const linkCount = layout.edges.length
   const guessedCount = layout.edges.filter((e) => e.inferred).length
@@ -634,13 +644,45 @@ export default function GraphView({ tables, onBack, onOpenTable, title }: Props)
         </div>
       </div>
 
-      {selected && (
+      {selected && relation && (
         <div className="sg-selection">
           <span className="sg-selection-name">{selected}</span>
-          <span className="sg-selection-meta">
-            {(incident.get(selected) ?? []).length} link
-            {(incident.get(selected) ?? []).length !== 1 ? 's' : ''}
+
+          <span className="sg-selection-rel">
+            <span className="sg-rel out" title={relation.references.join(', ') || 'None'}>
+              references {relation.references.length}
+            </span>
+            <span className="sg-rel in" title={relation.referencedBy.join(', ') || 'None'}>
+              referenced by {relation.referencedBy.length}
+            </span>
+            <span
+              className="sg-rel far"
+              title={
+                relation.indirect.length
+                  ? relation.indirect.join(', ')
+                  : 'No further tables within this depth'
+              }
+            >
+              indirect {relation.indirect.length}
+            </span>
           </span>
+
+          <span className="sg-depth" role="group" aria-label="Relation depth">
+            <span className="sg-depth-label">depth</span>
+            {DEPTHS.map((d) => (
+              <button
+                key={d.label}
+                type="button"
+                className={depth === d.value ? 'active' : ''}
+                onClick={() => setDepth(d.value)}
+                title={d.hint}
+                aria-pressed={depth === d.value}
+              >
+                {d.label}
+              </button>
+            ))}
+          </span>
+
           <button type="button" onClick={() => onOpenTable(selected)}>
             Open table ↗
           </button>
@@ -689,8 +731,8 @@ export default function GraphView({ tables, onBack, onOpenTable, title }: Props)
 
           <g className="sg-edges">
             {layout.edges.map((edge) => {
-              const lit = !!related && (related.has(edge.from) || related.has(edge.to))
-              const dim = (!!related && !lit) || (!!matches && !matches.has(edge.from) && !matches.has(edge.to))
+              const state = edgeHighlight(edge, highlight)
+              const direct = state.includes('lit')
               return (
                 <path
                   key={edge.id}
@@ -698,9 +740,9 @@ export default function GraphView({ tables, onBack, onOpenTable, title }: Props)
                     if (el) edgeEls.current.set(edge.id, el)
                     else edgeEls.current.delete(edge.id)
                   }}
-                  className={`sg-edge${edge.inferred ? ' guessed' : ''}${lit ? ' lit' : ''}${dim ? ' dim' : ''}`}
+                  className={`sg-edge${edge.inferred ? ' guessed' : ''}${state ? ' ' + state : ''}`}
                   d={pathFor(edge, offsets)}
-                  markerEnd={`url(#${lit ? 'sg-arrow-lit' : 'sg-arrow'})`}
+                  markerEnd={`url(#${direct ? 'sg-arrow-lit' : 'sg-arrow'})`}
                 >
                   <title>
                     {edge.pairs
@@ -717,10 +759,8 @@ export default function GraphView({ tables, onBack, onOpenTable, title }: Props)
               const off = offsets[node.name]
               const x = node.x + (off?.dx ?? 0)
               const y = node.y + (off?.dy ?? 0)
-              const isSelected = selected === node.name
-              const lit = !!related && related.has(node.name)
-              const hit = !!matches && matches.has(node.name)
-              const dim = (!!related && !lit) || (!!matches && !hit)
+              const hops = relation?.hops.get(node.name)
+              const state = nodeHighlight(node.name, highlight)
               const canExpand = node.hidden > 0 || expanded.has(node.name)
 
               return (
@@ -731,12 +771,7 @@ export default function GraphView({ tables, onBack, onOpenTable, title }: Props)
                     else nodeEls.current.delete(node.name)
                   }}
                   className={
-                    'sg-node' +
-                    (isSelected ? ' sel' : '') +
-                    (lit ? ' lit' : '') +
-                    (hit ? ' hit' : '') +
-                    (dim ? ' dim' : '') +
-                    (node.isolated ? ' lone' : '')
+                    `sg-node${state ? ' ' + state : ''}${node.isolated ? ' lone' : ''}`
                   }
                   transform={`translate(${x} ${y})`}
                   tabIndex={0}
@@ -754,7 +789,13 @@ export default function GraphView({ tables, onBack, onOpenTable, title }: Props)
                 >
                   <title>
                     {`${node.name} — ${node.rowCount.toLocaleString()} rows, ` +
-                      `${node.columnCount} columns\nDouble-click to open the table`}
+                      `${node.columnCount} columns` +
+                      (hops === 1
+                        ? `\nDirectly related to ${selected}`
+                        : hops !== undefined && hops > 1
+                          ? `\n${hops} hops from ${selected}`
+                          : '') +
+                      '\nDouble-click to open the table'}
                   </title>
 
                   <rect
@@ -876,6 +917,12 @@ export default function GraphView({ tables, onBack, onOpenTable, title }: Props)
               </li>
               <li>
                 <span className="sg-key fk" /> foreign key
+              </li>
+              <li>
+                <span className="sg-key box direct" /> direct relation
+              </li>
+              <li>
+                <span className="sg-key box indirect" /> indirect relation
               </li>
               <li>
                 <span className="sg-key line" /> declared link

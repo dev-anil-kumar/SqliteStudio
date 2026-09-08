@@ -251,10 +251,87 @@
   font-weight: 600;
 }
 
-.sg-selection-meta {
+/* Relation counts: which way each key runs, and what lies further out. */
+.sg-selection-rel {
   flex: 1;
-  font-size: 0.72rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.sg-rel {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.14rem 0.45rem;
+  font-size: 0.7rem;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-base);
   color: var(--text-secondary);
+  cursor: default;
+  white-space: nowrap;
+}
+
+.sg-rel::before {
+  content: '';
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  flex: none;
+}
+
+.sg-rel.out::before {
+  background: var(--sg-fk);
+}
+
+.sg-rel.in::before {
+  background: var(--accent);
+}
+
+.sg-rel.far::before {
+  background: transparent;
+  border: 1px solid var(--text-secondary);
+}
+
+.sg-depth {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 0.4rem;
+  background: var(--bg-base);
+  flex: none;
+}
+
+.sg-depth-label {
+  padding: 0 0.3rem;
+  font-size: 0.66rem;
+  color: var(--text-secondary);
+}
+
+.sg-selection .sg-depth button {
+  min-width: 1.3rem;
+  padding: 0.16rem 0.32rem;
+  font-size: 0.7rem;
+  border: 0;
+  border-radius: 0.28rem;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.sg-selection .sg-depth button:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.sg-selection .sg-depth button.active {
+  background: var(--accent);
+  color: var(--accent-fg);
 }
 
 .sg-selection button {
@@ -325,8 +402,15 @@
   opacity: 1;
 }
 
+/* A link between two related tables, neither of them the selected one. */
+.sg-edge.near {
+  stroke: color-mix(in srgb, var(--accent) 45%, var(--sg-link));
+  stroke-width: 1.8;
+  opacity: 0.9;
+}
+
 .sg-edge.dim {
-  opacity: 0.12;
+  opacity: 0.1;
 }
 
 .sg-arrow-head {
@@ -377,6 +461,22 @@
   stroke-width: 2.2;
 }
 
+/* Direct relations keep the accent; indirect ones stay legible but quieter,
+   so distance reads at a glance without anything being hidden outright. */
+.sg-node.direct .sg-box {
+  stroke: var(--accent);
+  stroke-width: 1.8;
+}
+
+.sg-node.indirect {
+  opacity: 0.72;
+}
+
+.sg-node.indirect .sg-box {
+  stroke: color-mix(in srgb, var(--accent) 40%, var(--border-subtle));
+  stroke-dasharray: 3 2.5;
+}
+
 .sg-node.hit .sg-box {
   stroke: var(--sg-pk);
   stroke-width: 2;
@@ -387,7 +487,7 @@
 }
 
 .sg-node.dim {
-  opacity: 0.22;
+  opacity: 0.16;
 }
 
 .sg-node {
@@ -598,6 +698,22 @@
 
 .sg-key.fk {
   background: var(--sg-fk);
+}
+
+.sg-key.box {
+  width: 0.75rem;
+  height: 0.5rem;
+  border-radius: 0.15rem;
+  background: var(--bg-elevated);
+}
+
+.sg-key.box.direct {
+  border: 1.5px solid var(--accent);
+}
+
+.sg-key.box.indirect {
+  border: 1.5px dashed color-mix(in srgb, var(--accent) 40%, var(--border-subtle));
+  opacity: 0.72;
 }
 
 .sg-key.line {
