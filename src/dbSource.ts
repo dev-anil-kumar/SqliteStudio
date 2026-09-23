@@ -10,8 +10,13 @@ import JSZip from 'jszip'
 
 // The 16-byte header every SQLite file starts with, NUL terminator included.
 const SQLITE_MAGIC = 'SQLite format 3\u0000'
-const DB_EXTENSIONS = ['.vyp', '.db', '.sqlite', '.sqlite3', '.sqlitedb']
-const ARCHIVE_EXTENSIONS = ['.vyb', '.zip']
+/** Extensions we treat as a bare SQLite database. */
+export const DB_EXTENSIONS = ['.vyp', '.db', '.sqlite', '.sqlite3', '.sqlitedb']
+/** Extensions we treat as a container that may hold databases. */
+export const ARCHIVE_EXTENSIONS = ['.vyb', '.zip']
+
+// Guard rail: a pathological archive must not lock the tab up while we sniff it.
+const ZIP_SCAN_LIMIT = 200
 
 export const ACCEPTED_EXTENSIONS = [...ARCHIVE_EXTENSIONS, ...DB_EXTENSIONS]
 
@@ -28,9 +33,40 @@ export type ResolvedDb = {
   sourceBytes: number
 }
 
+/** One SQLite database found inside whatever the user handed us. */
+export type DbCandidate = {
+  /** Display name of the database. */
+  name: string
+  /** Path inside the container ("" for a bare file — then it equals name). */
+  path: string
+  bytes: Uint8Array
+  sizeBytes: number
+}
+
+export type ResolvedContainer = {
+  kind: 'db' | 'archive'
+  /** Every SQLite database found. Never empty — the function throws instead. */
+  dbs: DbCandidate[]
+  /** Name of the container the user handed over. */
+  containerName: string
+  sourceBytes: number
+}
+
 export function hasAcceptedExtension(filename: string): boolean {
   const lower = filename.toLowerCase()
   return ACCEPTED_EXTENSIONS.some((ext) => lower.endsWith(ext))
+}
+
+/** True when the name ends in a known SQLite-ish extension. */
+export function looksLikeDbName(filename: string): boolean {
+  const lower = filename.toLowerCase()
+  return DB_EXTENSIONS.some((ext) => lower.endsWith(ext))
+}
+
+/** True when the name ends in a known archive extension. */
+export function looksLikeArchiveName(filename: string): boolean {
+  const lower = filename.toLowerCase()
+  return ARCHIVE_EXTENSIONS.some((ext) => lower.endsWith(ext))
 }
 
 function startsWith(bytes: Uint8Array, prefix: string): boolean {
@@ -62,9 +98,8 @@ function scoreEntry(name: string): number {
   return 1
 }
 
-async function extractDbFromZip(
-  buffer: ArrayBuffer
-): Promise<{ bytes: Uint8Array; entryName: string }> {
+/** Every SQLite entry inside a zip, in a stable order. */
+export async function extractDbsFromZip(buffer: ArrayBuffer): Promise<DbCandidate[]> {
   let zip: JSZip
   try {
     zip = await JSZip.loadAsync(buffer)
@@ -78,17 +113,39 @@ async function extractDbFromZip(
   if (entries.length === 0) throw new Error('Archive is empty')
 
   // Prefer .vyp, then other DB extensions, then anything with a SQLite header.
-  const ranked = [...entries].sort((a, b) => scoreEntry(b.name) - scoreEntry(a.name))
+  // Ties fall back to the entry name so the listing is stable across runs.
+  const ranked = [...entries].sort(
+    (a, b) => scoreEntry(b.name) - scoreEntry(a.name) || a.name.localeCompare(b.name)
+  )
+  // Nested archives are deliberately not recursed into.
+  const scanned = ranked.slice(0, ZIP_SCAN_LIMIT)
 
-  for (const entry of ranked) {
+  const found: DbCandidate[] = []
+  for (const entry of scanned) {
     const arrayBuffer = await entry.async('arraybuffer')
     const bytes = new Uint8Array(arrayBuffer)
-    if (isSqliteBytes(bytes)) return { bytes, entryName: entry.name }
+    if (!isSqliteBytes(bytes)) continue
+    found.push({
+      name: entry.name.split('/').filter(Boolean).pop() || entry.name,
+      path: entry.name,
+      bytes,
+      sizeBytes: bytes.byteLength,
+    })
   }
 
-  throw new Error(
-    `No SQLite database found inside the archive (checked ${entries.length} entr${entries.length === 1 ? 'y' : 'ies'})`
-  )
+  if (found.length === 0) {
+    throw new Error(
+      `No SQLite database found inside the archive (checked ${scanned.length} entr${scanned.length === 1 ? 'y' : 'ies'})`
+    )
+  }
+  return found
+}
+
+async function extractDbFromZip(
+  buffer: ArrayBuffer
+): Promise<{ bytes: Uint8Array; entryName: string }> {
+  const [first] = await extractDbsFromZip(buffer)
+  return { bytes: first.bytes, entryName: first.path }
 }
 
 /** Turns a downloaded/opened container into the DB bytes inside it. */
@@ -124,6 +181,51 @@ export async function resolveDb(buffer: ArrayBuffer, filename: string): Promise<
 
   throw new Error(
     'Not a SQLite database or zip archive — expected a .vyp/.db file or a .vyb/.zip containing one'
+  )
+}
+
+/**
+ * Resolves whatever bytes we were handed into the databases they contain.
+ * A bare SQLite file yields one; a zip yields every SQLite entry inside it.
+ * An unrecognised extension is probed as a zip before giving up.
+ */
+export async function resolveDbs(buffer: ArrayBuffer, filename: string): Promise<ResolvedContainer> {
+  const head = new Uint8Array(buffer, 0, Math.min(buffer.byteLength, 16))
+  const sourceBytes = buffer.byteLength
+  const name = filename || 'database'
+
+  if (isSqliteBytes(head)) {
+    return {
+      kind: 'db',
+      dbs: [
+        { name: filename, path: filename, bytes: new Uint8Array(buffer), sizeBytes: sourceBytes },
+      ],
+      containerName: filename,
+      sourceBytes,
+    }
+  }
+
+  // Magic bytes first; failing that, anything without a known DB extension is
+  // worth a speculative unzip — a .vyp that is really a zip still opens.
+  const looksZippy = isZipBytes(head)
+  if (looksZippy || !looksLikeDbName(filename)) {
+    try {
+      return {
+        kind: 'archive',
+        dbs: await extractDbsFromZip(buffer),
+        containerName: filename,
+        sourceBytes,
+      }
+    } catch (err) {
+      if (looksZippy || looksLikeArchiveName(filename)) throw err
+      throw new Error(
+        `No SQLite database found in "${name}" — it is not a database and not a readable archive`
+      )
+    }
+  }
+
+  throw new Error(
+    `"${name}" is not a SQLite database — expected a .vyp/.db file or a .vyb/.zip containing one`
   )
 }
 

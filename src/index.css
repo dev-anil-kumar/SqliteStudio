@@ -1,53 +1,170 @@
+/* ============================================================
+   Design tokens
+   ------------------------------------------------------------
+   Every colour, radius, shadow and glow in the app comes from
+   here. Three themes: dark (default), light, neon.
+   ============================================================ */
+
 :root,
 [data-theme="dark"] {
-  font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
+  color-scheme: dark;
+
+  /* Surfaces */
+  --bg-base: #0d1425;
+  --bg-elevated: #151d30;
+  --bg-sunken: #090f1c;
+  --bg-hover: #212c44;
+  --bg-overlay: rgba(5, 9, 18, 0.72);
+  --surface: #111a2c;
+  --surface-head: #18223a;
+
+  /* Text */
+  --text-primary: #e2e8f0;
+  --text-secondary: #97a5bb;
+  --text-faint: #64748b;
+
+  /* Lines */
+  --border-subtle: rgba(148, 163, 184, 0.16);
+  --border-strong: rgba(148, 163, 184, 0.34);
+
+  /* Accents */
+  --accent: #6366f1;
+  --accent-soft: rgba(99, 102, 241, 0.16);
+  --accent-fg: #ffffff;
+  --accent-2: #a855f7;
+
+  /* Semantic */
+  --danger: #f87171;
+  --danger-soft: rgba(248, 113, 113, 0.16);
+  --ok: #34d399;
+  --warn: #fbbf24;
+
+  /* Elevation */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 6px 18px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 24px 60px rgba(0, 0, 0, 0.6);
+  --glow: 0 0 0 1px rgba(99, 102, 241, 0.35), 0 6px 22px rgba(99, 102, 241, 0.18);
+
+  /* Geometry */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+
+  /* Canvas */
+  --grid-dot: rgba(148, 163, 184, 0.14);
+
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  color: var(--text-primary);
+  background-color: var(--bg-base);
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+
+  --bg-base: #f6f7fb;
+  --bg-elevated: #ffffff;
+  --bg-sunken: #eceff5;
+  --bg-hover: #eef1f7;
+  --bg-overlay: rgba(15, 23, 42, 0.32);
+  --surface: #ffffff;
+  --surface-head: #f4f6fa;
+
+  --text-primary: #0f172a;
+  --text-secondary: #55617a;
+  --text-faint: #8b95a9;
+
+  --border-subtle: #e4e8f0;
+  --border-strong: #cbd3e1;
+
+  --accent: #4f46e5;
+  --accent-soft: rgba(79, 70, 229, 0.1);
+  --accent-fg: #ffffff;
+  --accent-2: #9333ea;
+
+  --danger: #dc2626;
+  --danger-soft: rgba(220, 38, 38, 0.1);
+  --ok: #059669;
+  --warn: #b45309;
+
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
+  --shadow-md: 0 6px 18px rgba(15, 23, 42, 0.09);
+  --shadow-lg: 0 24px 60px rgba(15, 23, 42, 0.16);
+  --glow: none;
+
+  --grid-dot: rgba(15, 23, 42, 0.1);
+
+  color: var(--text-primary);
+  background-color: var(--bg-base);
+}
+
+[data-theme="neon"] {
+  color-scheme: dark;
+
+  --bg-base: #06070f;
+  --bg-elevated: #0d1020;
+  --bg-sunken: #03040a;
+  --bg-hover: #171c36;
+  --bg-overlay: rgba(3, 4, 10, 0.76);
+  --surface: #0a0d1a;
+  --surface-head: #111634;
+
+  --text-primary: #dff6f4;
+  --text-secondary: #92b3c4;
+  --text-faint: #5f7a8c;
+
+  --border-subtle: rgba(0, 245, 212, 0.16);
+  --border-strong: rgba(0, 245, 212, 0.38);
+
+  --accent: #00f5d4;
+  --accent-soft: rgba(0, 245, 212, 0.14);
+  --accent-fg: #04121a;
+  --accent-2: #ff2ed4;
+
+  --danger: #ff4d6d;
+  --danger-soft: rgba(255, 77, 109, 0.16);
+  --ok: #2bf5a0;
+  --warn: #ffd166;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.6);
+  --shadow-md: 0 6px 20px rgba(0, 0, 0, 0.66);
+  --shadow-lg: 0 24px 64px rgba(0, 0, 0, 0.8);
+  --glow: 0 0 0 1px rgba(0, 245, 212, 0.35), 0 0 18px rgba(0, 245, 212, 0.22);
+
+  --grid-dot: rgba(0, 245, 212, 0.16);
+
+  color: var(--text-primary);
+  background-color: var(--bg-base);
+}
+
+/* ============================================================
+   Base
+   ============================================================ */
+
+:root {
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
+    sans-serif;
   line-height: 1.5;
   font-weight: 400;
-  color-scheme: dark;
-  color: #e2e8f0;
-  background-color: #0f172a;
-  --text-primary: #e2e8f0;
-  --text-secondary: #94a3b8;
-  --bg-base: #0f172a;
-  --bg-elevated: #1e293b;
-  --bg-hover: #334155;
-  --border-subtle: rgba(148, 163, 184, 0.3);
-  --accent: #6366f1;
-  --accent-fg: #fff;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-[data-theme="light"] {
-  color-scheme: light;
-  color: #1e293b;
-  background-color: #f8fafc;
-  --text-primary: #1e293b;
-  --text-secondary: #64748b;
-  --bg-base: #f8fafc;
-  --bg-elevated: #f1f5f9;
-  --bg-hover: #e2e8f0;
-  --border-subtle: rgba(100, 116, 139, 0.35);
-  --accent: #4f46e5;
-  --accent-fg: #fff;
-}
-
-a {
-  font-weight: 500;
-  color: #6366f1;
-  text-decoration: inherit;
-}
-a:hover {
-  color: #818cf8;
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
 }
 
 html,
 body {
   margin: 0;
   width: 100%;
+  max-width: 100%;
   min-height: 100vh;
+  overflow-x: hidden;
   background-color: var(--bg-base);
   color: var(--text-primary);
 }
@@ -65,23 +182,142 @@ body {
   flex-direction: column;
 }
 
-h1 {
-  font-size: 3.2em;
-  line-height: 1.1;
+a {
+  font-weight: 500;
+  color: var(--accent);
+  text-decoration: inherit;
 }
 
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  cursor: pointer;
-  transition: border-color 0.25s;
+a:hover {
+  color: var(--accent);
+  filter: brightness(1.15);
 }
-button:focus,
-button:focus-visible {
+
+/* Sane heading scale — components override freely. */
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  margin: 0 0 0.5rem;
+  line-height: 1.25;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+h1 {
+  font-size: 1.6rem;
+}
+h2 {
+  font-size: 1.2rem;
+}
+h3 {
+  font-size: 1rem;
+}
+h4,
+h5,
+h6 {
+  font-size: 0.9rem;
+}
+
+/* No opinionated padding/skin here — component classes own that. */
+button {
+  margin: 0;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  color: inherit;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+input,
+textarea,
+select {
+  font-family: inherit;
+}
+
+code,
+pre,
+kbd,
+samp {
+  font-family: var(--font-mono);
+}
+
+/* ============================================================
+   Focus ring — one look everywhere
+   ============================================================ */
+
+:focus {
+  outline: none;
+}
+
+:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+[data-theme="neon"] :focus-visible {
+  box-shadow: var(--glow);
+}
+
+/* ============================================================
+   Scrollbars (scoped to the app)
+   ============================================================ */
+
+#root ::-webkit-scrollbar,
+#root::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+#root ::-webkit-scrollbar-track,
+#root::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+#root ::-webkit-scrollbar-thumb,
+#root::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+#root ::-webkit-scrollbar-thumb:hover,
+#root::-webkit-scrollbar-thumb:hover {
+  background: var(--text-faint);
+  background-clip: content-box;
+}
+
+#root ::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+#root {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+/* ============================================================
+   Motion preferences
+   ============================================================ */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
 }
