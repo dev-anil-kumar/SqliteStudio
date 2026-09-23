@@ -90,6 +90,10 @@ const SIDEBAR_KEY = 'vyb-sidebar-width'
 const SIDEBAR_COLLAPSED_KEY = 'vyb-sidebar-collapsed'
 const THEME_KEY = 'vyb-studio-theme'
 
+/** Kept in step with .pane-card's min-width / min-height in App.css. */
+const PANE_MIN_WIDTH = 320
+const PANE_MIN_HEIGHT = 420
+
 const ZOOM_MIN = 0.25
 const ZOOM_MAX = 2.5
 const GRID = 24
@@ -409,8 +413,17 @@ function App() {
       const ro = new ResizeObserver((obs) => {
         const entry = obs[0]
         if (!entry) return
-        const { width, height } = entry.contentRect
-        updatePaneSize(id, Math.round(width), Math.round(height))
+        // Must be the BORDER box: that is what the inline width/height we write
+        // back mean under `box-sizing: border-box`. Reading the content box
+        // instead feeds back 2px smaller every frame (the pane's border) and
+        // walks every pane down to its minimum size. It is also immune to the
+        // canvas' scale transform, which getBoundingClientRect is not.
+        const box = entry.borderBoxSize?.[0]
+        updatePaneSize(
+          id,
+          Math.round(box ? box.inlineSize : el.offsetWidth),
+          Math.round(box ? box.blockSize : el.offsetHeight)
+        )
       })
       ro.observe(el)
       observers.push(ro)
@@ -1589,10 +1602,15 @@ function App() {
   }
 
   function updatePaneSize(tabId: string, width: number, height: number) {
-    const w = Math.max(320, Math.round(width))
-    const h = Math.max(240, Math.round(height))
+    // Floors match .pane-card's CSS min-width/min-height, so state and layout
+    // never disagree about how small a pane is allowed to get.
+    const w = Math.max(PANE_MIN_WIDTH, Math.round(width))
+    const h = Math.max(PANE_MIN_HEIGHT, Math.round(height))
     setTabs((prev) => {
-      const changed = prev.some((t) => t.id === tabId && (t.width !== w || t.height !== h))
+      // Sub-pixel rounding must never round-trip into a resize loop.
+      const changed = prev.some(
+        (t) => t.id === tabId && (Math.abs(t.width - w) > 1 || Math.abs(t.height - h) > 1)
+      )
       return changed ? prev.map((tab) => (tab.id === tabId ? { ...tab, width: w, height: h } : tab)) : prev
     })
   }
