@@ -3222,3 +3222,83 @@ tbody tr:hover {
   color: var(--text-secondary);
   font-size: 0.85rem;
 }
+
+/* ============================================================
+   SQL editor — textarea plus its own undo/redo history
+   ============================================================ */
+
+.sql-editor {
+  position: relative;
+  display: flex;
+  width: 100%;
+  min-width: 0;
+}
+
+.sql-editor-area {
+  width: 100%;
+  min-width: 0;
+  display: block;
+}
+
+/* Kept out of the way until the editor is actually in use. */
+.sql-editor-history {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  box-shadow: var(--shadow-sm);
+  opacity: 0;
+  transform: translateY(-2px);
+  pointer-events: none;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+
+.sql-editor:hover .sql-editor-history,
+.sql-editor:focus-within .sql-editor-history {
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+}
+
+.sql-editor-history-btn {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  font-size: 0.8rem;
+  line-height: 1;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.sql-editor-history-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.sql-editor-history-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* The console's textarea rule is scoped to .console-pane, so the wrapper
+   has to stretch or the editor collapses to its content width. */
+.console-pane .sql-editor {
+  flex: 1;
+  min-height: 0;
+}
+
+/* A pane section that is mounted but not on show (keeps editor state alive). */
+.pane-section[data-hidden='true'] {
+  display: none;
+}

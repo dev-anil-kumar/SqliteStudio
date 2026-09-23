@@ -62,6 +62,7 @@ import {
   type DbCandidate,
 } from './dbSource'
 import GraphView from './GraphView'
+import SqlEditor from './SqlEditor'
 import './App.css'
 
 type SqlResult = QueryExecResult | null
@@ -2896,17 +2897,12 @@ function App() {
                         },
                         <>
                           <div className="pane-section">
-                            <textarea
+                            <SqlEditor
                               className="console-editor query-editor"
                               value={tab.sql}
-                              spellCheck={false}
-                              onChange={(e) => updateConsole(tab.id, { sql: e.target.value })}
-                              onKeyDown={(e) => {
-                                if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-                                  e.preventDefault()
-                                  runConsole(tab.id)
-                                }
-                              }}
+                              onChange={(sql) => updateConsole(tab.id, { sql })}
+                              onRun={() => runConsole(tab.id)}
+                              label="SQL console query"
                               placeholder="SELECT * FROM … — ⌘/Ctrl+Enter to run"
                             />
                             <div className="console-toolbar">
@@ -3013,20 +3009,20 @@ function App() {
                           <div className="pane-section">{renderFilterPanel(tab, tableInfo)}</div>
                         )}
 
-                        {tab.panel === 'sql' && (
-                          <div className="query-section pane-section">
-                            <textarea
+                        {/* Always mounted, only hidden: unmounting it would throw
+                            away the editor's undo history every time someone
+                            glanced at the Filter or Schema tab. */}
+                        <div
+                          className="query-section pane-section"
+                          data-hidden={tab.panel !== 'sql'}
+                        >
+                            <SqlEditor
                               className="query-editor"
                               rows={4}
-                              spellCheck={false}
                               value={tab.query}
-                              onChange={(e) => handleQueryChange(tab.id, e.target.value)}
-                              onKeyDown={(e) => {
-                                if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-                                  e.preventDefault()
-                                  handleExecuteQuery(tab.id)
-                                }
-                              }}
+                              onChange={(query) => handleQueryChange(tab.id, query)}
+                              onRun={() => handleExecuteQuery(tab.id)}
+                              label={`SQL for ${tab.tableName}`}
                               placeholder="SQL query..."
                             />
                             <div className="query-actions">
@@ -3046,10 +3042,10 @@ function App() {
                               </button>
                             </div>
                             <p className="query-hint">
-                              ⌘/Ctrl+Enter runs. REGEXP and EDITDIST(a, b) are available here too.
+                              ⌘/Ctrl+Enter runs, ⌘/Ctrl+Z undoes. REGEXP and EDITDIST(a, b)
+                              are available here too.
                             </p>
-                          </div>
-                        )}
+                        </div>
 
                         {tab.panel === 'schema' && tableInfo && (
                           <div className="pane-section">{renderSchemaPanel(tableInfo)}</div>
